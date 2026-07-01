@@ -50,7 +50,7 @@ says which is which.
 - No package-level mutable state (enforced by `gochecknoglobals`). Constants and
   small pure lookup tables are fine. Dependencies are passed in via constructors
   (`New(...)`), not reached through globals.
-- Only `cmd/gateway` wires concrete implementations together (reads config,
+- Only `cmd/heave` wires concrete implementations together (reads config,
   constructs providers/router/ledger/server). Library packages accept
   interfaces/values; they do not self-wire.
 

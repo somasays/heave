@@ -53,7 +53,7 @@ community can maintain them without a code change.
 may only import packages below it; there are no cycles.
 
 ```
-cmd/gateway            (composition root — wires everything, reads config)
+cmd/heave            (composition root — wires everything, reads config)
     │  imports ▼
 internal/server        (request flow: translate ▸ route ▸ dispatch ▸ account)
     │  imports ▼
@@ -62,14 +62,14 @@ internal/openai   internal/router   internal/ledger   internal/provider
         │                │                 │                   │
         └── stdlib ──────┴─────────────────┘        vendor SDKs ┘ (outward only)
 
-internal/config        (loaded only by cmd/gateway)
+internal/config        (loaded only by cmd/heave)
 ```
 
 Concretely:
 - `internal/openai`, `internal/router`, `internal/ledger` are **pure**: stdlib
   only, no other internal package. They are trivially unit-testable in isolation.
 - `internal/config` imports stdlib + the YAML lib only, and is imported **only**
-  by `cmd/gateway`.
+  by `cmd/heave`.
 - `internal/provider` faces **outward** (vendor SDKs) and must not import the
   core inward (`server`/`router`/`ledger`/`config`/`openai`) — so Phase 1 can
   wrap adapters with failover/redaction without a dependency inversion.
@@ -78,7 +78,7 @@ Concretely:
 *Enforced:* `depguard` in `.golangci.yml` (one rule per layer) + `check_arch.sh`
 for the vendor-boundary and secret rules.
 
-**#A2 — The composition root is `cmd/gateway`.** Only `cmd/gateway` constructs
+**#A2 — The composition root is `cmd/heave`.** Only `cmd/heave` constructs
 concrete implementations and wires them together. Library packages accept
 interfaces/values through `New(...)` constructors and never self-wire or reach
 for globals. *Why:* dependencies are visible and swappable; tests inject fakes.

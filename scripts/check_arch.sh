@@ -21,7 +21,7 @@ done < <(grep -rl "$vendor_sdk" --include='*.go' . 2>/dev/null || true)
 while IFS= read -r hit; do
   f="${hit%%:*}"
   case "$f" in
-    ./internal/provider/*|./cmd/gateway/main.go) ;;  # main sets the openai default base
+    ./internal/provider/*|./cmd/heave/main.go) ;;  # main sets the openai default base
     *) note "$hit — vendor endpoint host referenced outside internal/provider." ;;
   esac
 done < <(grep -rn -e 'api\.anthropic\.com' -e 'api\.openai\.com' --include='*.go' . 2>/dev/null || true)

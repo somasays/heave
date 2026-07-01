@@ -1,6 +1,6 @@
-# Binaries
+# Built binaries (anchored so they don't match the cmd/heave source dir)
 /bin/
-gateway
+/heave
 
 # Local config (may contain provider/model choices; keys are always env-only)
 /config.yaml

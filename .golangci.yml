@@ -28,22 +28,22 @@ linters:
         openai-pure:
           files: ["**/internal/openai/**"]
           deny:
-            - pkg: github.com/somasays/gateway/internal
+            - pkg: github.com/somasays/heave/internal
               desc: "internal/openai is the pure wire-format package; it must not import other internal packages"
         router-pure:
           files: ["**/internal/router/**"]
           deny:
-            - pkg: github.com/somasays/gateway/internal
+            - pkg: github.com/somasays/heave/internal
               desc: "internal/router must stay pure (no other internal packages)"
         ledger-pure:
           files: ["**/internal/ledger/**"]
           deny:
-            - pkg: github.com/somasays/gateway/internal
+            - pkg: github.com/somasays/heave/internal
               desc: "internal/ledger must stay pure (no other internal packages)"
         config-pure:
           files: ["**/internal/config/**"]
           deny:
-            - pkg: github.com/somasays/gateway/internal
+            - pkg: github.com/somasays/heave/internal
               desc: "internal/config must not import other internal packages"
 
         # The provider boundary faces outward (vendors) only. It must not depend
@@ -51,19 +51,19 @@ linters:
         provider-outward-only:
           files: ["**/internal/provider/**"]
           deny:
-            - pkg: github.com/somasays/gateway/internal/server
-            - pkg: github.com/somasays/gateway/internal/router
-            - pkg: github.com/somasays/gateway/internal/ledger
-            - pkg: github.com/somasays/gateway/internal/config
-            - pkg: github.com/somasays/gateway/internal/openai
+            - pkg: github.com/somasays/heave/internal/server
+            - pkg: github.com/somasays/heave/internal/router
+            - pkg: github.com/somasays/heave/internal/ledger
+            - pkg: github.com/somasays/heave/internal/config
+            - pkg: github.com/somasays/heave/internal/openai
 
         # The server orchestrates the request flow but does not read config —
-        # wiring concrete implementations belongs to cmd/gateway only.
+        # wiring concrete implementations belongs to cmd/heave only.
         server-no-config:
           files: ["**/internal/server/**"]
           deny:
-            - pkg: github.com/somasays/gateway/internal/config
-              desc: "internal/server must not import config; wiring belongs to cmd/gateway"
+            - pkg: github.com/somasays/heave/internal/config
+              desc: "internal/server must not import config; wiring belongs to cmd/heave"
 
     forbidigo:
       forbid:

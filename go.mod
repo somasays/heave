@@ -1,4 +1,4 @@
-module github.com/somasays/gateway
+module github.com/somasays/heave
 
 go 1.26.4
 

@@ -15,10 +15,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/somasays/gateway/internal/ledger"
-	"github.com/somasays/gateway/internal/openai"
-	"github.com/somasays/gateway/internal/provider"
-	"github.com/somasays/gateway/internal/router"
+	"github.com/somasays/heave/internal/ledger"
+	"github.com/somasays/heave/internal/openai"
+	"github.com/somasays/heave/internal/provider"
+	"github.com/somasays/heave/internal/router"
 )
 
 // Server holds the dependencies for the HTTP handlers.

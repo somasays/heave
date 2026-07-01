@@ -6,11 +6,11 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/heave ./cmd/heave
 
 FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/gateway /gateway
+COPY --from=build /out/heave /heave
 COPY config.example.yaml /config.yaml
 EXPOSE 8080
 USER nonroot:nonroot
-ENTRYPOINT ["/gateway", "-config", "/config.yaml"]
+ENTRYPOINT ["/heave", "-config", "/config.yaml"]

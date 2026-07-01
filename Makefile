@@ -17,11 +17,11 @@ lint: ## Run the linters (layering + style enforcement)
 
 .PHONY: build
 build: ## Build the gateway binary into ./bin
-	@go build -o bin/gateway ./cmd/gateway
+	@go build -o bin/heave ./cmd/heave
 
 .PHONY: run
 run: build ## Build and run against config.yaml
-	@./bin/gateway -config config.yaml
+	@./bin/heave -config config.yaml
 
 .PHONY: test
 test: ## Run tests only

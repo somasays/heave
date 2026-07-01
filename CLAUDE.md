@@ -1,4 +1,4 @@
-# gateway — agent & contributor guide
+# heave — agent & contributor guide
 
 Self-hostable, OpenAI-compatible LLM gateway. The differentiator is
 **cache-aware routing** (keep a conversation on its warm-cache model; re-route

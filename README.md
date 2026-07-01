@@ -1,4 +1,4 @@
-# gateway
+# heave
 
 A self-hostable, OpenAI-compatible LLM gateway: one endpoint in front of many
 models, with **cost accounting applied before any request reaches a vendor**.

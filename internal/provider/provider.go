@@ -1,7 +1,7 @@
 // Package provider defines the boundary between the gateway core and vendor
 // APIs. Every model vendor is reached through a Provider adapter; no other
 // package imports a vendor SDK or calls a vendor endpoint (docs/INVARIANTS.md,
-// Invariant #2 — enforced by scripts/check-architecture.sh).
+// Invariant #2 — enforced by scripts/check_arch.sh).
 package provider
 
 import "context"

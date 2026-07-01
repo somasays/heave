@@ -26,5 +26,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.12.2
+          install-mode: binary
+          # We invoke the linter ourselves inside scripts/check.sh (one source
+          # of truth); this step only installs and caches the binary.
+          args: --version
       - name: Run the single verification command
         run: bash scripts/check.sh

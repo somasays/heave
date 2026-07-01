@@ -10,18 +10,20 @@ only when the prefix cache TTL lapses). Everything else is table stakes.
   compose `state` profile; the binary runs without them.
 
 ## Commands (source of truth: Makefile / scripts/check.sh)
-- `make check` — the one gate: gofmt → arch → vet → build → test (fail-cheap).
+- `make check` — the one gate, fail-cheap: gofmt → arch grep → build →
+  golangci-lint → test -race. Requires `golangci-lint` (brew install).
 - `make hooks` — install git hooks (run once after clone).
 - `make run`   — build and run against config.yaml.
 
-## Architectural invariants (full text: docs/INVARIANTS.md — enforced in CI)
-1. One ingress format: OpenAI Chat Completions. No vendor shapes leak inward.
-2. Vendors are reached ONLY through `internal/provider` adapters.
-3. Routing decisions go through `internal/router`; cache-awareness is the wedge.
-4. Secrets come from env via config; never in code or config files.
-5. Every dispatched request is recorded in `internal/ledger`.
-6. Prices and routing are declarative data, not code.
-`scripts/check_arch.sh` enforces #2 and #4 mechanically.
+## Invariants (FULL text + enforcement matrix: docs/INVARIANTS.md)
+Design (#1–#6): one OpenAI ingress format; vendors only via `internal/provider`;
+routing via `internal/router` (cache-awareness is the wedge); secrets from env;
+every request accounted in `internal/ledger`; config is declarative data.
+Architecture (#A1–#A5): one-directional layered imports (no cycles), `cmd` is
+the only composition root, no global mutable state, context propagates. Plus
+error-provenance, concurrency, observability, security invariants. Enforced by
+`depguard` (layering), `check_arch.sh` (vendor/secret boundary), `forbidigo`,
+`gochecknoglobals`, `noctx`, `bodyclose`, `-race`. Go style: docs/STYLE.md.
 
 ## Commit policy (enforced by .githooks/commit-msg)
 - Commit messages MUST NOT attribute authorship to an AI: no `Co-Authored-By:

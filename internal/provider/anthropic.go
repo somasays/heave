@@ -50,7 +50,7 @@ func (a *Anthropic) ChatCompletion(ctx context.Context, req *Request) (*Response
 	}
 
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(req.Model),
+		Model:     req.Model,
 		MaxTokens: int64(maxTokens),
 		Messages:  msgs,
 	}

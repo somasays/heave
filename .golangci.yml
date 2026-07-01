@@ -1,0 +1,81 @@
+# Mechanical enforcement of the architecture and style invariants
+# (docs/INVARIANTS.md, docs/STYLE.md). This is the Go equivalent of
+# import-linter / dependency-cruiser / ArchUnit — CI enforces structure so
+# review can focus on design (article lever #12). Run via `make check`.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - depguard         # package layering / dependency direction (Invariants #1, #2)
+    - forbidigo        # ban fmt.Print* etc. — structured logging only (STYLE)
+    - gochecknoglobals # no package-level mutable state (STYLE)
+    - bodyclose        # every HTTP response body is closed (STYLE, HTTP)
+    - noctx            # outbound HTTP requests carry a context (STYLE, Context)
+    - misspell
+    - unconvert
+    - revive
+
+  settings:
+    depguard:
+      rules:
+        # Pure packages: the wire format, router, ledger, and config must not
+        # depend on any other internal package. This keeps the core acyclic and
+        # keeps these packages reusable/testable in isolation.
+        openai-pure:
+          files: ["**/internal/openai/**"]
+          deny:
+            - pkg: github.com/somasays/gateway/internal
+              desc: "internal/openai is the pure wire-format package; it must not import other internal packages"
+        router-pure:
+          files: ["**/internal/router/**"]
+          deny:
+            - pkg: github.com/somasays/gateway/internal
+              desc: "internal/router must stay pure (no other internal packages)"
+        ledger-pure:
+          files: ["**/internal/ledger/**"]
+          deny:
+            - pkg: github.com/somasays/gateway/internal
+              desc: "internal/ledger must stay pure (no other internal packages)"
+        config-pure:
+          files: ["**/internal/config/**"]
+          deny:
+            - pkg: github.com/somasays/gateway/internal
+              desc: "internal/config must not import other internal packages"
+
+        # The provider boundary faces outward (vendors) only. It must not depend
+        # on the core inward, so failover/redaction/cost logic can wrap it later.
+        provider-outward-only:
+          files: ["**/internal/provider/**"]
+          deny:
+            - pkg: github.com/somasays/gateway/internal/server
+            - pkg: github.com/somasays/gateway/internal/router
+            - pkg: github.com/somasays/gateway/internal/ledger
+            - pkg: github.com/somasays/gateway/internal/config
+            - pkg: github.com/somasays/gateway/internal/openai
+
+        # The server orchestrates the request flow but does not read config —
+        # wiring concrete implementations belongs to cmd/gateway only.
+        server-no-config:
+          files: ["**/internal/server/**"]
+          deny:
+            - pkg: github.com/somasays/gateway/internal/config
+              desc: "internal/server must not import config; wiring belongs to cmd/gateway"
+
+    forbidigo:
+      forbid:
+        - pattern: '^fmt\.Print.*$'
+        - pattern: '^print$'
+        - pattern: '^println$'
+
+    revive:
+      rules:
+        - name: package-comments
+        - name: exported
+
+formatters:
+  enable:
+    - gofmt

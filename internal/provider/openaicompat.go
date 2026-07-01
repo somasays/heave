@@ -79,7 +79,7 @@ func (o *OpenAICompat) ChatCompletion(ctx context.Context, req *Request) (*Respo
 		msgs = append(msgs, ocMessage{Role: "system", Content: req.System})
 	}
 	for _, m := range req.Messages {
-		msgs = append(msgs, ocMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, ocMessage(m))
 	}
 
 	body, err := json.Marshal(ocRequest{
@@ -106,7 +106,7 @@ func (o *OpenAICompat) ChatCompletion(ctx context.Context, req *Request) (*Respo
 		// the server can classify timeouts as 504.
 		return nil, &Error{StatusCode: 0, Type: "api_error", Message: o.name + ": " + err.Error()}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBytes))
 	if err != nil {

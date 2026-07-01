@@ -51,7 +51,7 @@ func testServer(t *testing.T, fp *fakeProvider, sampling bool, timeout time.Dura
 }
 
 func post(h http.Handler, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	return rr

@@ -11,6 +11,10 @@ check: ## Run the full fail-fast verification (fmt, arch, vet, build, test)
 fmt: ## Auto-format all Go code
 	@gofmt -w .
 
+.PHONY: lint
+lint: ## Run the linters (layering + style enforcement)
+	@golangci-lint run ./...
+
 .PHONY: build
 build: ## Build the gateway binary into ./bin
 	@go build -o bin/gateway ./cmd/gateway

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The single verification command (article lever #3: fail fast and local).
 # Ordered cheapest-first so the pipeline fails cheap — formatting and the pure
-# grep architecture check run before the compiler, and the compiler before the
-# tests. The same script runs locally, in the pre-commit hook, and in CI, so
-# there is one source of truth for "is this change OK".
+# grep architecture check run before the compiler, the compiler before the
+# linter, and the linter before the race-enabled tests. The same script runs
+# locally, in the pre-commit hook, and in CI, so there is one source of truth
+# for "is this change OK".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,16 +24,22 @@ fi
 step "architecture boundaries"
 bash scripts/check_arch.sh
 
-# 3. Vet — cheap static analysis (compiles, so it comes before tests).
-step "go vet"
-go vet ./...
-
-# 4. Build — must compile.
+# 3. Build — must compile before deeper analysis.
 step "go build"
 go build ./...
 
+# 4. Lint — layering (depguard) + style enforcement (docs/INVARIANTS.md,
+#    docs/STYLE.md). Reuses the build cache from step 3.
+step "golangci-lint"
+if ! command -v golangci-lint >/dev/null 2>&1; then
+  echo "golangci-lint is required. Install: brew install golangci-lint" >&2
+  echo "  (or see https://golangci-lint.run/welcome/install/)" >&2
+  exit 1
+fi
+golangci-lint run ./...
+
 # 5. Tests — hermetic and fast; last because they are the most expensive.
-# -race is on: the single verification command must catch concurrency bugs.
+#    -race is on: the single verification command must catch concurrency bugs.
 step "go test -race"
 go test -race ./...
 

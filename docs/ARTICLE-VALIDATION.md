@@ -21,7 +21,7 @@ Status legend: ✅ implemented · 🟡 partial / scaffolded · ⬜ planned.
 | 9 | Machine-readable runbooks + structured logs | 🟡 | Structured JSON logs (`internal/ledger`, slog); runbooks TBD |
 | 10 | Brokered credentials (read broad / write gated) | 🟡 | Secrets from env only (Invariant #4); brokering is Phase 1+ |
 | 11 | Mine sessions into team knowledge | 🟡 | `docs/reviews/`, ADRs under `docs/adr/` |
-| 12 | Enforce design in CI, not review | ✅ | `scripts/check_arch.sh` enforces Invariants #2/#4 |
+| 12 | Enforce design in CI, not review | ✅ | `depguard` in `.golangci.yml` enforces the package layering (the Go analog of import-linter/ArchUnit); `scripts/check_arch.sh` enforces the vendor/secret boundary |
 | 13 | Version specs/prompts as code; protect main | ✅ | `CLAUDE.md`, `docs/INVARIANTS.md`, config all in VC; hooks + CI |
 
 ## The two meta-forces, in this repo

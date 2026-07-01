@@ -1,0 +1,33 @@
+# `docker compose up` runs a working single-node gateway (Phase 0 needs no
+# external state). Redis (cache-state, Phase 2) and Postgres (spend ledger,
+# Phase 3) live behind the `state` profile so they start only when needed:
+#   docker compose --profile state up
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # Provide keys in your shell or a .env file (never commit real keys).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    # Mount your own config over the baked-in example:
+    # volumes:
+    #   - ./config.yaml:/config.yaml:ro
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["state"]
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["state"]
+    environment:
+      - POSTGRES_USER=gateway
+      - POSTGRES_PASSWORD=gateway
+      - POSTGRES_DB=gateway
+    ports:
+      - "5432:5432"

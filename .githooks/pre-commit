@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Pre-commit gate. Runs the single fail-fast verification command so a commit
+# cannot land in a broken state. Install with `make hooks` (sets core.hooksPath).
+set -euo pipefail
+exec bash "$(git rev-parse --show-toplevel)/scripts/check.sh"

@@ -1,0 +1,20 @@
+# Binaries
+/bin/
+gateway
+
+# Local config (may contain provider/model choices; keys are always env-only)
+/config.yaml
+
+# Env files with secrets — never commit
+.env
+.env.*
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

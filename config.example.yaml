@@ -1,0 +1,66 @@
+# Gateway configuration. Copy to config.yaml and edit.
+#
+# Secrets are NEVER written here: each provider names an environment variable
+# that holds its API key (see docs/INVARIANTS.md, Invariant #4). Prices are data
+# so the community can maintain them without code changes (Invariant #6).
+
+server:
+  addr: ":8080"
+  request_timeout: 120s     # per-request upstream deadline
+  max_request_bytes: 1048576 # 1 MiB request-body cap (DoS guard)
+
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY
+    # base_url: https://api.anthropic.com   # optional override
+
+  - name: openai
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+
+  # OpenRouter and other OpenAI-compatible vendors reuse the "openai" type:
+  # - name: openrouter
+  #   type: openai
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key_env: OPENROUTER_API_KEY
+
+# Client-facing model aliases -> provider + upstream model id + price + policy.
+# Prices are USD per million tokens (source: claude-api model catalog, 2026).
+#
+# `sampling: false` marks models that REJECT temperature/top_p (Claude Opus 4.8,
+# Sonnet 5, ...). The gateway strips those params for such models so a common
+# client setting does not turn into an upstream 400. Omit `sampling` (defaults
+# true) for models that accept them.
+models:
+  - id: fast
+    provider: anthropic
+    upstream: claude-haiku-4-5
+    price: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+    max_output_tokens: 8192
+
+  - id: balanced
+    provider: anthropic
+    upstream: claude-sonnet-5
+    # Sonnet 5 sticker is $3/$15 (intro $2/$10 through 2026-08-31).
+    price: { input_per_mtok: 3.0, output_per_mtok: 15.0 }
+    max_output_tokens: 16384
+    sampling: false
+
+  - id: smart
+    provider: anthropic
+    upstream: claude-opus-4-8
+    price: { input_per_mtok: 5.0, output_per_mtok: 25.0 }
+    max_output_tokens: 16384
+    sampling: false
+
+  - id: gpt
+    provider: openai
+    upstream: gpt-4o
+    price: { input_per_mtok: 2.5, output_per_mtok: 10.0 }
+    max_output_tokens: 4096
+
+routing:
+  # Alias used when a request omits `model`.
+  default_model: fast

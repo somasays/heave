@@ -1,0 +1,30 @@
+name: ci
+
+# Fail cheap: one job, checks ordered cheapest-first inside scripts/check.sh
+# (gofmt -> architecture grep -> vet -> build -> test). The expensive steps only
+# run if the near-instant ones pass. Concurrency cancels superseded runs so we
+# never pay for stale work.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run the single verification command
+        run: bash scripts/check.sh

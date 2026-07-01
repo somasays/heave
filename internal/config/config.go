@@ -1,0 +1,147 @@
+// Package config loads the declarative gateway configuration. Prices and model
+// routing are data, not code (docs/INVARIANTS.md, Invariant #6). Secrets are
+// never in the file or in code: providers name an environment variable that
+// holds the API key (Invariant #4).
+package config
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the whole gateway configuration.
+type Config struct {
+	Server    Server     `yaml:"server"`
+	Providers []Provider `yaml:"providers"`
+	Models    []Model    `yaml:"models"`
+	Routing   Routing    `yaml:"routing"`
+}
+
+// Server holds listen and hardening configuration.
+type Server struct {
+	Addr string `yaml:"addr"`
+	// RequestTimeout bounds a single upstream call (client + gateway share it).
+	RequestTimeout time.Duration `yaml:"request_timeout"`
+	// MaxRequestBytes caps the request body to prevent memory-exhaustion DoS.
+	MaxRequestBytes int64 `yaml:"max_request_bytes"`
+}
+
+// Provider describes one vendor adapter to construct.
+type Provider struct {
+	Name string `yaml:"name"`
+	// Type selects the adapter: "anthropic" or "openai".
+	Type string `yaml:"type"`
+	// BaseURL optionally overrides the vendor endpoint (also used for
+	// OpenAI-compatible vendors like OpenRouter).
+	BaseURL string `yaml:"base_url"`
+	// APIKeyEnv names the environment variable holding the API key. The key
+	// itself is never written in config.
+	APIKeyEnv string `yaml:"api_key_env"`
+}
+
+// Model is one client-facing routable model.
+type Model struct {
+	// ID is the alias clients request.
+	ID string `yaml:"id"`
+	// Provider references a Provider.Name.
+	Provider string `yaml:"provider"`
+	// Upstream is the vendor model id actually sent.
+	Upstream string `yaml:"upstream"`
+	Price    Price  `yaml:"price"`
+	// MaxOutputTokens is the default max_tokens when the client omits it.
+	MaxOutputTokens int `yaml:"max_output_tokens"`
+	// Sampling reports whether the model accepts temperature/top_p. Pointer so
+	// an omitted value defaults to true; set false for models that reject
+	// sampling params (e.g. Claude Opus 4.8 / Sonnet 5).
+	Sampling *bool `yaml:"sampling"`
+}
+
+// AcceptsSampling reports whether the model accepts sampling params (default
+// true when unset).
+func (m Model) AcceptsSampling() bool { return m.Sampling == nil || *m.Sampling }
+
+// Price is per-million-token cost in USD.
+type Price struct {
+	InputPerMTok  float64 `yaml:"input_per_mtok"`
+	OutputPerMTok float64 `yaml:"output_per_mtok"`
+}
+
+// Routing holds routing policy.
+type Routing struct {
+	DefaultModel string `yaml:"default_model"`
+}
+
+// Load reads and validates the config file at path.
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var c Config
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := c.validate(); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (c *Config) validate() error {
+	if c.Server.Addr == "" {
+		c.Server.Addr = ":8080"
+	}
+	if c.Server.RequestTimeout <= 0 {
+		c.Server.RequestTimeout = 120 * time.Second
+	}
+	if c.Server.MaxRequestBytes <= 0 {
+		c.Server.MaxRequestBytes = 1 << 20 // 1 MiB
+	}
+	if len(c.Providers) == 0 {
+		return fmt.Errorf("config: no providers defined")
+	}
+	if len(c.Models) == 0 {
+		return fmt.Errorf("config: no models defined")
+	}
+	provNames := make(map[string]bool, len(c.Providers))
+	for _, p := range c.Providers {
+		if p.Name == "" || p.Type == "" {
+			return fmt.Errorf("config: provider missing name or type")
+		}
+		if p.Type != "anthropic" && p.Type != "openai" {
+			return fmt.Errorf("config: provider %q has unknown type %q", p.Name, p.Type)
+		}
+		if provNames[p.Name] {
+			return fmt.Errorf("config: duplicate provider name %q", p.Name)
+		}
+		provNames[p.Name] = true
+	}
+	aliases := make(map[string]bool, len(c.Models))
+	for _, m := range c.Models {
+		if m.ID == "" {
+			return fmt.Errorf("config: model missing id")
+		}
+		if aliases[m.ID] {
+			return fmt.Errorf("config: duplicate model id %q", m.ID)
+		}
+		aliases[m.ID] = true
+		if !provNames[m.Provider] {
+			return fmt.Errorf("config: model %q references unknown provider %q", m.ID, m.Provider)
+		}
+	}
+	if c.Routing.DefaultModel != "" && !aliases[c.Routing.DefaultModel] {
+		return fmt.Errorf("config: default_model %q is not a defined model", c.Routing.DefaultModel)
+	}
+	return nil
+}
+
+// APIKey resolves the provider's API key from its named environment variable.
+func (p Provider) APIKey() string {
+	if p.APIKeyEnv == "" {
+		return ""
+	}
+	return os.Getenv(p.APIKeyEnv)
+}

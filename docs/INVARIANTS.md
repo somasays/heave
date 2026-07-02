@@ -26,13 +26,15 @@ vendor at once.
 endpoint host. *Why:* provider boundaries are the seams that let failover,
 redaction, and cost controls apply uniformly.
 
-**#3 — Routing goes through the router; cache-awareness is the wedge.** Model
-selection happens in `internal/router.Route`. The naive approach scores each turn
-independently and switches models freely, silently destroying the per-model
-prefix cache. The router instead treats cache warmth as a first-class signal: a
-conversation stays on its current model while the cache is warm and only becomes
-eligible to re-route once it goes quiet long enough for the TTL to lapse. *Why:*
-this is the feature that justifies the project over LiteLLM/OpenRouter.
+**#3 — Routing goes through the router; cache-state is an efficiency signal, not
+the headline.** Model selection happens in `internal/router`. Cache warmth is
+tracked (`internal/cache`) and can inform routing, but the spike measured its
+value honestly at ~10–13% — concentrated in long conversations, negative on most
+short ones (`docs/BENCHMARK.md`). *Correction:* an earlier version of this
+invariant claimed cache-aware routing "justifies the project over
+LiteLLM/OpenRouter"; our own benchmark refuted that. Cache-state is retained as a
+cache-efficiency *observability* signal (hit-rate, cache-busting/prefix-stability
+detection). The project's justification is Invariant #9, not this.
 
 **#4 — Secrets from the environment.** API keys are resolved from environment
 variables named in config; they never appear in code, config files, or logs.
@@ -67,6 +69,21 @@ success. It fails over only on *retryable* errors — transport failures/timeout
 429, and 5xx — never on a 4xx client error, which would fail identically on every
 provider. *Why:* retrying a doomed request across providers wastes latency and
 money and can mask a real client bug.
+
+**#9 — Enforcement is real-time, pre-vendor, and hard (the wedge).** heave's
+reason to exist is being the enforcement point for agentic spend and provider
+quota: controls that stop damage *before* a vendor is billed, with correctness
+guarantees — not after-the-fact dashboards or monthly caps. This generalizes the
+reserve/settle machinery (Invariant #7) from a monthly budget to short time
+constants and run scope: **token-velocity caps** ($/min per key/run), **per-run
+kill switches**, **loop/anomaly detection** (repeated near-identical prefixes =
+a runaway agent), **concurrency caps**, and **provider-quota brokering**
+(schedule/prioritize against a shared provider rate limit instead of merely
+failing over after a 429). *Why:* a runaway agent burns five figures in hours —
+a monthly budget is the wrong time constant, and "failover after 429" doesn't
+arbitrate a quota ten teams share. This is the acute, underserved pain where
+heave's pre-vendor / reserve-settle / Go-data-plane DNA is a real advantage
+rather than a re-implementation of LiteLLM.
 
 ---
 

@@ -3,12 +3,18 @@
 A self-hostable, OpenAI-compatible LLM gateway: one endpoint in front of many
 models, with **cost accounting applied before any request reaches a vendor**.
 
-The differentiator is **cache-aware routing** — most gateways score each turn
-independently and switch models freely, silently destroying the per-model prefix
-cache. This gateway treats cache warmth as a first-class routing signal: a
-conversation stays on its warm-cache model and only becomes eligible to re-route
-once it goes quiet long enough for the prefix-cache TTL to lapse. (That's the
-Phase 2 wedge; see `docs/TASKS.md`.)
+The differentiator is being a **runtime spend & quota firewall for agentic
+traffic**: hard, real-time controls enforced *before* a request reaches a vendor.
+Monthly budgets don't stop a runaway agent burning five figures overnight, and
+"failover after a 429" doesn't arbitrate a provider quota shared across ten
+teams. heave's job is the enforcement point that does — token-velocity caps
+($/min per key/run), per-run kill switches, loop/anomaly detection, concurrency
+caps, and provider-quota brokering, on a single fast Go data-plane binary.
+
+> We spiked cache-aware routing as the original wedge and measured it honestly:
+> ~10–13%, concentrated in long conversations (see `docs/BENCHMARK.md`). Real,
+> but not a headline — it lives on as a cache-efficiency *observability* signal,
+> not the reason to deploy heave.
 
 > Status: **Phase 0** — a working OpenAI-compatible proxy with multi-provider
 > dispatch and per-request cost accounting. Not yet production-hardened.

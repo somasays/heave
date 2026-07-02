@@ -1,8 +1,11 @@
 # heave — agent & contributor guide
 
-Self-hostable, OpenAI-compatible LLM gateway. The differentiator is
-**cache-aware routing** (keep a conversation on its warm-cache model; re-route
-only when the prefix cache TTL lapses). Everything else is table stakes.
+Self-hostable, OpenAI-compatible LLM gateway. The differentiator is a **runtime
+spend & quota firewall for agentic traffic**: hard, real-time, PRE-vendor
+enforcement (token-velocity caps, per-run kill switches, loop/anomaly detection,
+concurrency caps, provider-quota brokering) built on the reserve/settle machinery
+(Invariant #7). Cache-aware routing was spiked and measured (~10–13%, `docs/
+BENCHMARK.md`); it's now a cache-efficiency observability signal, not the wedge.
 
 ## Stack
 - Go 1.26, standard library HTTP. Anthropic via the official `anthropic-sdk-go`.

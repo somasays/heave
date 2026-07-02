@@ -5,6 +5,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"os"
 	"time"
@@ -18,6 +19,25 @@ type Config struct {
 	Providers []Provider `yaml:"providers"`
 	Models    []Model    `yaml:"models"`
 	Routing   Routing    `yaml:"routing"`
+	Auth      Auth       `yaml:"auth"`
+	Clients   []Client   `yaml:"clients"`
+}
+
+// Auth toggles gateway authentication.
+type Auth struct {
+	// Enabled gates the auth/rate/budget controls. Defaults to false so local
+	// dev is frictionless; a loud warning is logged when disabled. Production
+	// deployments MUST set this true (docs/INVARIANTS.md, Invariant #7).
+	Enabled bool `yaml:"enabled"`
+}
+
+// Client is one authenticated caller and its limits. The plaintext key is never
+// stored: operators configure the hex SHA-256 of the bearer token.
+type Client struct {
+	Name             string  `yaml:"name"`
+	KeySHA256        string  `yaml:"key_sha256"`
+	MonthlyBudgetUSD float64 `yaml:"monthly_budget_usd"`
+	RateLimitRPM     int     `yaml:"rate_limit_rpm"`
 }
 
 // Server holds listen and hardening configuration.
@@ -134,6 +154,40 @@ func (c *Config) validate() error {
 	}
 	if c.Routing.DefaultModel != "" && !aliases[c.Routing.DefaultModel] {
 		return fmt.Errorf("config: default_model %q is not a defined model", c.Routing.DefaultModel)
+	}
+	if err := c.validateClients(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Config) validateClients() error {
+	if c.Auth.Enabled && len(c.Clients) == 0 {
+		return fmt.Errorf("config: auth.enabled is true but no clients are defined")
+	}
+	names := make(map[string]bool, len(c.Clients))
+	hashes := make(map[string]bool, len(c.Clients))
+	for _, cl := range c.Clients {
+		if cl.Name == "" {
+			return fmt.Errorf("config: client missing name")
+		}
+		if names[cl.Name] {
+			return fmt.Errorf("config: duplicate client name %q", cl.Name)
+		}
+		names[cl.Name] = true
+		if len(cl.KeySHA256) != 64 {
+			return fmt.Errorf("config: client %q key_sha256 must be a 64-char hex SHA-256", cl.Name)
+		}
+		if _, err := hex.DecodeString(cl.KeySHA256); err != nil {
+			return fmt.Errorf("config: client %q key_sha256 is not valid hex", cl.Name)
+		}
+		if hashes[cl.KeySHA256] {
+			return fmt.Errorf("config: duplicate client key_sha256 (client %q)", cl.Name)
+		}
+		hashes[cl.KeySHA256] = true
+		if cl.MonthlyBudgetUSD < 0 || cl.RateLimitRPM < 0 {
+			return fmt.Errorf("config: client %q has a negative budget or rate limit", cl.Name)
+		}
 	}
 	return nil
 }

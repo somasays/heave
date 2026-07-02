@@ -64,3 +64,27 @@ models:
 routing:
   # Alias used when a request omits `model`.
   default_model: fast
+
+# Gateway authentication + per-client controls (Phase 1). When enabled, callers
+# must send `Authorization: Bearer <key>`; auth, rate limits, and budgets are
+# enforced BEFORE any vendor call (Invariant #7).
+#
+# This example ships auth ENABLED and FAILS CLOSED: the placeholder client below
+# has an all-zero key hash that matches no real key, so a copy-paste deploy
+# rejects everyone (401) until you add your own key — it is never an open proxy.
+#
+# Generate a strong key and its hash (keys MUST be high-entropy random):
+#   KEY=$(openssl rand -hex 32)
+#   echo "your key:   $KEY"
+#   echo "key_sha256: $(printf '%s' "$KEY" | shasum -a 256 | cut -d' ' -f1)"
+# For trusted local-only use you may instead set `enabled: false` (a loud warning
+# is logged). NOTE: limits below are PER INSTANCE — with N replicas the effective
+# ceiling is N× the configured budget and RPM (shared store lands in Phase 3).
+auth:
+  enabled: true
+
+clients:
+  - name: replace-me
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+    monthly_budget_usd: 100     # 0 = unlimited
+    rate_limit_rpm: 60          # 0 = unlimited

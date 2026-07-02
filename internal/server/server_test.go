@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/openai"
 	"github.com/somasays/heave/internal/provider"
@@ -45,13 +48,21 @@ func testServer(t *testing.T, fp *fakeProvider, sampling bool, timeout time.Dura
 		Price: router.Price{InputPerMTok: 3, OutputPerMTok: 15}, AcceptsSampling: sampling,
 	}}, "m")
 	led := ledger.New(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	srv := New(rtr, map[string]provider.Provider{"fake": fp}, led, slog.New(slog.NewTextHandler(io.Discard, nil)),
+	guard := controls.New(false, nil, nil) // auth disabled for most tests
+	srv := New(rtr, map[string]provider.Provider{"fake": fp}, led, guard, slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Options{MaxRequestBytes: 1 << 20, RequestTimeout: timeout})
 	return srv.Handler()
 }
 
 func post(h http.Handler, body string) *httptest.ResponseRecorder {
+	return postAuth(h, body, "")
+}
+
+func postAuth(h http.Handler, body, bearer string) *httptest.ResponseRecorder {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	return rr
@@ -147,10 +158,54 @@ func TestSamplingStrippedForRejectingModel(t *testing.T) {
 func TestBodyTooLarge(t *testing.T) {
 	rtr := router.New([]router.ModelConfig{{Alias: "m", Provider: "fake", Upstream: "up"}}, "m")
 	led := ledger.New(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	srv := New(rtr, map[string]provider.Provider{"fake": &fakeProvider{resp: &provider.Response{}}}, led,
+	guard := controls.New(false, nil, nil)
+	srv := New(rtr, map[string]provider.Provider{"fake": &fakeProvider{resp: &provider.Response{}}}, led, guard,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), Options{MaxRequestBytes: 32, RequestTimeout: time.Second})
 	rr := post(srv.Handler(), `{"model":"m","messages":[{"role":"user","content":"`+strings.Repeat("x", 200)+`"}]}`)
 	if rr.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("want 413, got %d", rr.Code)
+	}
+}
+
+func authServer(t *testing.T, clients []controls.Client) http.Handler {
+	t.Helper()
+	rtr := router.New([]router.ModelConfig{{Alias: "m", Provider: "fake", Upstream: "up-1"}}, "m")
+	led := ledger.New(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	guard := controls.New(true, clients, nil)
+	fp := &fakeProvider{resp: &provider.Response{Content: "ok", InputTokens: 1, OutputTokens: 1}}
+	srv := New(rtr, map[string]provider.Provider{"fake": fp}, led, guard, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
+	return srv.Handler()
+}
+
+func sha(k string) string {
+	sum := sha256.Sum256([]byte(k))
+	return hex.EncodeToString(sum[:])
+}
+
+func TestAuthRequiredAndAccepted(t *testing.T) {
+	h := authServer(t, []controls.Client{{Name: "team-a", KeySHA256: sha("secret")}})
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+
+	if rr := post(h, body); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("no key: want 401, got %d", rr.Code)
+	}
+	if rr := postAuth(h, body, "wrong"); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("bad key: want 401, got %d", rr.Code)
+	}
+	if rr := postAuth(h, body, "secret"); rr.Code != 200 {
+		t.Fatalf("good key: want 200, got %d: %s", rr.Code, rr.Body)
+	}
+}
+
+func TestRateLimitReturns429(t *testing.T) {
+	h := authServer(t, []controls.Client{{Name: "a", KeySHA256: sha("k"), RateLimitRPM: 1}})
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	if rr := postAuth(h, body, "k"); rr.Code != 200 {
+		t.Fatalf("first: want 200, got %d", rr.Code)
+	}
+	rr := postAuth(h, body, "k")
+	if rr.Code != http.StatusTooManyRequests || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("second: want 429 with Retry-After, got %d ra=%q", rr.Code, rr.Header().Get("Retry-After"))
 	}
 }

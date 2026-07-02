@@ -13,8 +13,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/openai"
 	"github.com/somasays/heave/internal/provider"
@@ -26,6 +29,7 @@ type Server struct {
 	router         *router.Router
 	providers      map[string]provider.Provider
 	ledger         *ledger.Ledger
+	guard          *controls.Guard
 	log            *slog.Logger
 	maxRequestBody int64
 	requestTimeout time.Duration
@@ -38,7 +42,7 @@ type Options struct {
 }
 
 // New builds a Server.
-func New(r *router.Router, providers map[string]provider.Provider, l *ledger.Ledger, log *slog.Logger, opts Options) *Server {
+func New(r *router.Router, providers map[string]provider.Provider, l *ledger.Ledger, g *controls.Guard, log *slog.Logger, opts Options) *Server {
 	if opts.MaxRequestBytes <= 0 {
 		opts.MaxRequestBytes = 1 << 20
 	}
@@ -49,6 +53,7 @@ func New(r *router.Router, providers map[string]provider.Provider, l *ledger.Led
 		router:         r,
 		providers:      providers,
 		ledger:         l,
+		guard:          g,
 		log:            log,
 		maxRequestBody: opts.MaxRequestBytes,
 		requestTimeout: opts.RequestTimeout,
@@ -84,6 +89,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Cap the body so an unauthenticated client cannot OOM the process.
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxRequestBody)
+
+	// Authenticate + rate limit BEFORE any parsing or vendor call (Invariant
+	// #7). client is nil when auth is disabled. Budget is enforced after the
+	// cost is known (Reserve, below).
+	client, err := s.guard.Admit(bearerToken(r))
+	if err != nil {
+		s.denied(w, client, err)
+		return
+	}
 
 	var req openai.ChatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -124,14 +138,23 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reserve an upper-bound cost against the client's budget BEFORE dispatch,
+	// so concurrent requests cannot all pass and overshoot the cap.
+	reservation, err := s.guard.Reserve(client, estimateCostUSD(preq, decision))
+	if err != nil {
+		s.denied(w, client, err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancel()
 
 	presp, err := prov.ChatCompletion(ctx, preq)
 	if err != nil {
+		s.guard.Settle(reservation, 0) // release the hold; failed request booked at 0
 		s.ledger.Record(ledger.Record{
 			RequestID: requestID, Alias: decision.Alias, Provider: decision.Provider,
-			Upstream: decision.Upstream, User: req.User, LatencyMS: time.Since(start).Milliseconds(),
+			Upstream: decision.Upstream, User: userName(client, &req), LatencyMS: time.Since(start).Milliseconds(),
 			Status: "error",
 		})
 		status, typ, msg, retryAfter := classifyError(ctx, err)
@@ -144,14 +167,84 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	cost := ledger.Cost(presp.InputTokens, presp.OutputTokens, presp.CacheReadInputTokens, presp.CacheWriteInputTokens,
 		decision.Price.InputPerMTok, decision.Price.OutputPerMTok)
+	s.guard.Settle(reservation, cost)
 	s.ledger.Record(ledger.Record{
 		RequestID: requestID, Alias: decision.Alias, Provider: decision.Provider, Upstream: decision.Upstream,
-		User: req.User, InputTokens: presp.InputTokens, OutputTokens: presp.OutputTokens,
+		User: userName(client, &req), InputTokens: presp.InputTokens, OutputTokens: presp.OutputTokens,
 		CacheReadTokens: presp.CacheReadInputTokens, CacheWriteTokens: presp.CacheWriteInputTokens,
 		CostUSD: cost, LatencyMS: time.Since(start).Milliseconds(), Status: "ok",
 	})
 
 	writeJSON(w, http.StatusOK, toOpenAIResponse(requestID, decision.Alias, presp))
+}
+
+// estimateCostUSD is an upper-bound cost for budget reservation: estimated input
+// tokens (rough chars/4) plus the resolved max output tokens, at the model's
+// price. Reconciled to the real cost by Settle after the response.
+func estimateCostUSD(preq *provider.Request, decision router.Decision) float64 {
+	chars := len(preq.System)
+	for _, m := range preq.Messages {
+		chars += len(m.Content)
+	}
+	estInput := chars / 4
+	maxOut := preq.MaxTokens
+	if maxOut <= 0 {
+		maxOut = 4096
+	}
+	return ledger.Cost(estInput, maxOut, 0, 0, decision.Price.InputPerMTok, decision.Price.OutputPerMTok)
+}
+
+// bearerToken extracts the token from an "Authorization: Bearer <token>" header,
+// trimming surrounding whitespace (copy-paste / header-file newlines are a
+// common source of otherwise-silent 401s).
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):])
+	}
+	return ""
+}
+
+// userName attributes spend to the authenticated client, falling back to the
+// request's own `user` field when auth is disabled.
+func userName(client *controls.Client, req *openai.ChatCompletionRequest) string {
+	if client != nil {
+		return client.Name
+	}
+	return req.User
+}
+
+// denied maps a controls rejection to the right HTTP status and logs it, so
+// throttled/over-budget callers are observable (rejections never reach the
+// ledger, since no spend occurred). client may be nil (auth failure).
+func (s *Server) denied(w http.ResponseWriter, client *controls.Client, err error) {
+	who := "unknown"
+	if client != nil {
+		who = client.Name
+	}
+	var rle *controls.RateLimitError
+	var be *controls.BudgetError
+	switch {
+	case errors.Is(err, controls.ErrUnauthorized):
+		s.log.Warn("request denied", "reason", "unauthorized", "client", who)
+		writeError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key")
+	case errors.As(err, &rle):
+		s.log.Warn("request denied", "reason", "rate_limited", "client", who)
+		if rle.RetryAfterSec > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(rle.RetryAfterSec))
+		}
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "rate limit exceeded")
+	case errors.As(err, &be):
+		s.log.Warn("request denied", "reason", "budget_exceeded", "client", who)
+		if be.RetryAfterSec > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(be.RetryAfterSec))
+		}
+		writeError(w, http.StatusTooManyRequests, "insufficient_quota", "monthly budget exceeded")
+	default:
+		s.log.Warn("request denied", "reason", "authorization_failed", "client", who)
+		writeError(w, http.StatusInternalServerError, "api_error", "authorization failed")
+	}
 }
 
 // unsupported reports a clear message (and false) when the request uses a

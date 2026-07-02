@@ -16,19 +16,33 @@ Phase 2 wedge; see `docs/TASKS.md`.)
 ## Quick start
 
 ```bash
-cp config.example.yaml config.yaml       # edit models/providers as you like
-export ANTHROPIC_API_KEY=sk-ant-...       # keys come from the environment only
-make hooks                                # one-time: install commit gates
-make run                                  # build + run on :8080
+cp config.example.yaml config.yaml        # edit models/providers as you like
+export ANTHROPIC_API_KEY=sk-ant-...        # vendor keys come from the env only
+make hooks                                 # one-time: install commit gates
+make run                                   # build + run on :8080
 ```
 
-Then call it with any OpenAI client:
+The example config **ships with gateway auth enabled and fails closed** — a
+placeholder client rejects everyone until you add your own key. Mint one and set
+its hash in `config.yaml`:
+
+```bash
+KEY=$(openssl rand -hex 32)
+echo "gateway key: $KEY"
+printf '%s' "$KEY" | shasum -a 256 | cut -d' ' -f1   # → put under clients[].key_sha256
+```
+
+Then call it with any OpenAI client, sending that key as the bearer:
 
 ```bash
 curl localhost:8080/v1/chat/completions \
+  -H "authorization: Bearer $KEY" \
   -H 'content-type: application/json' \
   -d '{"model":"fast","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+For trusted local-only use, set `auth.enabled: false` in `config.yaml` (a loud
+warning is logged, and the bearer header is then optional).
 
 `GET /healthz` for liveness, `GET /metrics` for running request/token/cost
 totals.

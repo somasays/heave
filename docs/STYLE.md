@@ -68,12 +68,25 @@ says which is which.
   closed channel). No fire-and-forget goroutines without a lifecycle.
 
 ## Tests
-- Tests are hermetic: no network, no real API keys, no wall-clock sleeps beyond
-  small deterministic timeouts. Use `httptest` for HTTP boundaries and fakes for
-  the `Provider` interface.
-- Table-driven where it reduces duplication; one clear assertion focus per test.
-- The request path (handlers, translation, error mapping, config validation) must
-  stay covered — a regression there should fail CI, not production.
+Two tiers, kept strictly separate:
+
+- **Hermetic tier (the gate).** Everything run by `make check`: no network, no
+  real API keys, no wall-clock sleeps beyond small deterministic timeouts, clocks
+  injected. Use `httptest` for HTTP boundaries and fakes for the `Provider`
+  interface. This tier must stay fast, deterministic, and offline — it is the
+  blocking pre-commit/CI gate. Concurrency-sensitive code carries a `-race`
+  test that actually contends (a single-goroutine test makes `-race` a false
+  comfort).
+- **Live tier (opt-in, never in the gate).** Real, billed provider calls behind
+  the `//go:build live` tag; run with `make smoke`. Each test `t.Skip`s when its
+  API key is absent, uses the cheapest model and a tiny `max_tokens`, and never
+  runs on the commit path (it's non-deterministic and costs money — article
+  lever #3). CI runs it only via the separate manual/nightly `smoke` workflow
+  when the key secret exists.
+
+Table-driven where it reduces duplication; one clear assertion focus per test.
+The request path (handlers, translation, error mapping, config validation) must
+stay covered in the hermetic tier — a regression there should fail CI, not prod.
 
 ## Comments
 - Every package has a package doc comment explaining its responsibility and any

@@ -1,0 +1,28 @@
+name: smoke
+
+# LIVE smoke tests against real provider APIs. Deliberately SEPARATE from the
+# blocking `ci` gate: these cost money, need secrets, and are non-deterministic,
+# so they must never block a commit/PR (article lever #3: keep the fast path
+# hermetic). Run manually, or nightly, and only if the API key secret exists.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *" # nightly 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Live smoke (skips if no key)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: go test -tags live -run Live -count=1 ./...

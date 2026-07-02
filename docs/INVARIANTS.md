@@ -45,6 +45,18 @@ always attributable. An unrecorded request is invisible spend.
 (max output, sampling support) live in YAML, not code, so operators and the
 community can maintain them without a code change.
 
+**#7 — Controls apply before the vendor.** Authentication, per-client rate
+limits, and budget caps are checked in `internal/controls` and reject the request
+*before* it reaches a provider — the gateway spends its own CPU rejecting abuse,
+never a vendor's billed tokens. Client keys are stored only as SHA-256 hashes
+(never plaintext) and MUST be high-entropy random. Budget uses a reserve/settle
+hold (an upper-bound estimate is reserved before dispatch, reconciled after) so
+concurrent requests cannot all pass a stale pre-check and overshoot the cap.
+*Why:* a cost/abuse control that runs after the vendor call has already lost the
+money it was meant to save. *Caveat:* limits are in-memory and per-instance — N
+replicas allow N× the configured RPM/budget until the shared store lands
+(Phase 3); documented on the config fields and in `controls`.
+
 ---
 
 ## 2. Architecture invariants
@@ -55,12 +67,13 @@ may only import packages below it; there are no cycles.
 ```
 cmd/heave            (composition root — wires everything, reads config)
     │  imports ▼
-internal/server        (request flow: translate ▸ route ▸ dispatch ▸ account)
+internal/server        (request flow: admit ▸ translate ▸ route ▸ dispatch ▸ account)
     │  imports ▼
-internal/openai   internal/router   internal/ledger   internal/provider
-   (wire types)     (routing)         (accounting)       (vendor adapters)
-        │                │                 │                   │
-        └── stdlib ──────┴─────────────────┘        vendor SDKs ┘ (outward only)
+internal/openai  internal/router  internal/ledger  internal/provider  internal/controls
+  (wire types)     (routing)        (accounting)      (vendor adapters)   (auth/rate/budget)
+        │               │                │                  │                  │
+        └── stdlib ─────┴────────────────┴──────────────────┴──────────────────┘
+                                                    vendor SDKs ┘ (provider only, outward)
 
 internal/config        (loaded only by cmd/heave)
 ```
@@ -196,6 +209,7 @@ Fail-cheap ordering inside `scripts/check.sh`: gofmt → architecture grep → b
 | #4 secrets from env | `check_arch.sh` + `.gitignore` |
 | #5 every request accounted | `server`/`ledger` tests + review |
 | #6 config is data | `config` validation + review |
+| #7 controls before vendor | `controls`/`server` tests (auth/rate/budget) + `depguard` (controls-pure) |
 | #A2 composition root / #A3 interface ownership | `depguard` + review |
 | #A4 no global mutable state | `gochecknoglobals` |
 | #A5 context propagation | `noctx` + review |

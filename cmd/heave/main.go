@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/somasays/heave/internal/config"
+	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/provider"
 	"github.com/somasays/heave/internal/router"
@@ -56,7 +57,20 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	rtr := router.New(models, cfg.Routing.DefaultModel)
 	led := ledger.New(log)
-	srv := server.New(rtr, providers, led, log, server.Options{
+
+	clients := make([]controls.Client, 0, len(cfg.Clients))
+	for _, c := range cfg.Clients {
+		clients = append(clients, controls.Client{
+			Name: c.Name, KeySHA256: c.KeySHA256,
+			MonthlyBudgetUSD: c.MonthlyBudgetUSD, RateLimitRPM: c.RateLimitRPM,
+		})
+	}
+	guard := controls.New(cfg.Auth.Enabled, clients, nil)
+	if !cfg.Auth.Enabled {
+		log.Warn("authentication is DISABLED; do not expose this gateway to untrusted callers (set auth.enabled: true)")
+	}
+
+	srv := server.New(rtr, providers, led, guard, log, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,
 	})

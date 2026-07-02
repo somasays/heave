@@ -27,6 +27,10 @@ run: build ## Build and run against config.yaml
 test: ## Run tests only
 	@go test ./...
 
+.PHONY: smoke
+smoke: ## Run LIVE smoke tests against real provider APIs (needs API keys; costs money)
+	@go test -tags live -run Live -count=1 ./...
+
 .PHONY: hooks
 hooks: ## Install the versioned git hooks (pre-commit + commit-msg)
 	@git config core.hooksPath .githooks

@@ -12,7 +12,7 @@ Status legend: ✅ implemented · 🟡 partial / scaffolded · ⬜ planned.
 |---|-------|--------|--------------------|
 | 1 | Self-describing repo context (`CLAUDE.md`, <60 lines) | ✅ | `CLAUDE.md` |
 | 2 | Context window as a managed resource | 🟡 | Reviews run in isolated sub-agents; durable decisions in `docs/` + memory |
-| 3 | Fail fast and local (one command, <60s, ordered) | ✅ | `scripts/check.sh`, `make check`, `.githooks/pre-commit` |
+| 3 | Fail fast and local (one command, <60s, ordered) | ✅ | `scripts/check.sh`, `make check`, `.githooks/pre-commit`; live/networked tests quarantined out of the gate behind `//go:build live` (`make smoke`, separate `smoke` workflow) |
 | 4 | Build caching / affected-only | 🟡 | Docker layer caching (`Dockerfile`); Go build cache in CI |
 | 5 | Monorepo with real tooling | ⬜ | single module today; not needed yet |
 | 6 | Merge queue with blast-radius tiering | ⬜ | Phase 1+ (branch protection first) |

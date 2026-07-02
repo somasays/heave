@@ -45,6 +45,11 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/config must not import other internal packages"
+        controls-pure:
+          files: ["**/internal/controls/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/controls must stay pure (no other internal packages)"
 
         # The provider boundary faces outward (vendors) only. It must not depend
         # on the core inward, so failover/redaction/cost logic can wrap it later.

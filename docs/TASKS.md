@@ -33,12 +33,26 @@ Invariant: Phase gate).
 - ⬜ Send `cache_control` breakpoints (belongs to Phase 2).
 
 ## Phase 1 — Controls
-- ⬜ **Gateway auth (API-key check)** — must land before any non-local deploy;
-  Phase 0 leaves `/v1/chat/completions` unauthenticated (LLM review #10).
-- ⬜ Budgets + rate caps per key/team (reject before vendor).
+- ✅ **Gateway auth + rate caps + budgets (reject before vendor)** —
+  `internal/controls` (Bearer + SHA-256 keys, token-bucket rate limit, monthly
+  budget via reserve/settle), wired before dispatch; Invariant #7. In-memory,
+  per-instance (durable/shared store → Phase 3). Reviews: ✅ security
+  (`docs/reviews/phase1-security.md`, FAIL→pass-with-follow-ups) · ✅ Go
+  (`docs/reviews/phase1-go.md`).
 - ⬜ PII redaction pre-flight hook.
 - ⬜ Cross-provider failover with health tracking.
-- Reviews: ⬜ LLM-apps · ⬜ Go
+
+### Deferred from Phase 1 controls reviews
+- ⬜ Per-client rejection counters on /metrics (denials now logged, not counted).
+- ⬜ Key revocation/expiry + hot config reload (leaked key is live until restart).
+- ⬜ Global (gateway-wide) rate + concurrency cap (only per-client today).
+- ⬜ Per-model / per-provider budgets; org/team hierarchy (flat per-client now).
+- ⬜ Settle billed failures at actual cost (currently released at 0).
+
+## Testing
+- ✅ Two-tier tests: hermetic gate (`make check`, `-race`) + live smoke tier
+  (`//go:build live`, `make smoke`, nightly `smoke` workflow) — real provider
+  calls, key-gated, never in the blocking gate.
 
 ## Phase 2 — Cache-aware routing (the wedge)
 - ⬜ Redis cache-state store (per-conversation model/prefix_hash/last_seen/ttl).

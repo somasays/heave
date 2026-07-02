@@ -24,6 +24,20 @@ type Config struct {
 	Clients   []Client   `yaml:"clients"`
 	Failover  Failover   `yaml:"failover"`
 	Redaction Redaction  `yaml:"redaction"`
+	Firewall  Firewall   `yaml:"firewall"`
+}
+
+// Firewall configures the runtime spend & quota firewall (Invariant #9): hard,
+// pre-vendor enforcement for agentic traffic. All limits are per-instance for
+// now; 0 disables a given limit.
+type Firewall struct {
+	Enabled         bool    `yaml:"enabled"`
+	MaxUSDPerMin    float64 `yaml:"max_usd_per_min"`
+	MaxTokensPerMin int     `yaml:"max_tokens_per_min"`
+	MaxConcurrent   int     `yaml:"max_concurrent"`
+	// LoopThreshold auto-kills a run after it repeats the same prompt-prefix
+	// this many times (a runaway agent). 0 disables loop detection.
+	LoopThreshold int `yaml:"loop_threshold"`
 }
 
 // Failover tunes the per-provider circuit breaker used during model failover.
@@ -198,6 +212,10 @@ func (c *Config) validate() error {
 	}
 	if c.Failover.ConsecutiveFailures < 0 {
 		return fmt.Errorf("config: failover.consecutive_failures must be >= 0")
+	}
+	if c.Firewall.MaxUSDPerMin < 0 || c.Firewall.MaxTokensPerMin < 0 ||
+		c.Firewall.MaxConcurrent < 0 || c.Firewall.LoopThreshold < 0 {
+		return fmt.Errorf("config: firewall limits must be >= 0")
 	}
 	return nil
 }

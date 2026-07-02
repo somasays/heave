@@ -65,6 +65,11 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/cache must stay pure (no other internal packages)"
+        firewall-pure:
+          files: ["**/internal/firewall/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/firewall must stay pure (no other internal packages)"
         cachebench-pure:
           files: ["**/internal/cachebench/**"]
           deny:

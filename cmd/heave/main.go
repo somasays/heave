@@ -18,6 +18,7 @@ import (
 
 	"github.com/somasays/heave/internal/config"
 	"github.com/somasays/heave/internal/controls"
+	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/provider"
@@ -78,10 +79,21 @@ func run(configPath string, log *slog.Logger) error {
 	if redactor.Enabled() {
 		log.Info("PII redaction is enabled (regex-based, best-effort)")
 	}
+	fw := firewall.New(cfg.Firewall.Enabled, firewall.Limits{
+		MaxUSDPerMin:    cfg.Firewall.MaxUSDPerMin,
+		MaxTokensPerMin: cfg.Firewall.MaxTokensPerMin,
+		MaxConcurrent:   cfg.Firewall.MaxConcurrent,
+		LoopThreshold:   cfg.Firewall.LoopThreshold,
+	}, nil)
+	if fw.Enabled() {
+		log.Info("spend/quota firewall enabled",
+			"usd_per_min", cfg.Firewall.MaxUSDPerMin, "max_concurrent", cfg.Firewall.MaxConcurrent,
+			"loop_threshold", cfg.Firewall.LoopThreshold)
+	}
 
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
-		Health: tracker, Redactor: redactor, Log: log,
+		Health: tracker, Redactor: redactor, Firewall: fw, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,

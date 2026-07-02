@@ -98,6 +98,17 @@ failover:
   consecutive_failures: 3
   cooldown: 30s
 
+# Runtime spend & quota firewall (Invariant #9): hard, real-time, pre-vendor
+# enforcement for agentic traffic. Send `X-Heave-Run-Id: <id>` to scope limits to
+# an agent run; kill a runaway with `POST /v1/runs/<id>/kill`. Limits are
+# per-instance for now; 0 disables a given limit.
+firewall:
+  enabled: false
+  max_usd_per_min: 0        # rolling $/min cap, per key AND per run
+  max_tokens_per_min: 0     # rolling tokens/min cap
+  max_concurrent: 0         # max in-flight requests per key/run
+  loop_threshold: 8         # auto-kill a run after N identical prompt-prefixes (runaway)
+
 # Pre-flight PII/secret redaction (regex-based, best-effort). Off by default —
 # it is lossy and can change model behavior. Built-ins: email, SSN, credit card,
 # phone, API keys. `custom_patterns` maps a rule name to a Go regexp.

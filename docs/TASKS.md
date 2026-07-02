@@ -102,16 +102,24 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   per-instance memory; without it every guarantee is fiction at >1 replica
   (N× problem). Degrade safely (fail-open vs fail-closed is a policy choice).
 
-## Phase 3F — Firewall primitives (the headline)
-- ⬜ **Run identity** — a `run_id` (header or derived) so limits/kills scope to
-  an agent run, not just a client key.
-- ⬜ **Token-velocity caps** — $/min (and tokens/min) per key and per run,
-  enforced pre-vendor via the reserve/settle machinery at a 1-minute window.
-- ⬜ **Per-run kill switch** — an API + auto-trip to hard-stop a runaway run.
-- ⬜ **Concurrency caps** — max in-flight per key/run.
-- ⬜ **Loop / anomaly detection** — repeated near-identical prefixes within a run
-  = a runaway agent; trip the breaker. (Prefix hashing reuses `internal/cache`.)
-- Reviews: ⬜ security · ⬜ Go (per phase gate)
+## Phase 3F — Firewall primitives (the headline) — MVP DONE
+- ✅ **Run identity** — `X-Heave-Run-Id`, scope namespaced by the authenticated
+  key (a spoofed run id can't touch another caller's run).
+- ✅ **Velocity caps** — $/min and tokens/min per key AND per run, **reserved**
+  at admit via a `Ticket` (reserve/settle) so concurrent requests can't overshoot.
+- ✅ **Per-run kill switch** — `POST /v1/runs/{id}/kill` (owner-scoped) + auto-trip.
+- ✅ **Concurrency caps** — max in-flight per key/run.
+- ✅ **Repeated-prompt detection** — sliding-window (catches A/B alternation);
+  exact-hash, so a per-turn nonce defeats it (heuristic, documented).
+- Reviews: ✅ security (`docs/reviews/phase3f-firewall-security.md`, FAIL→fixed) ·
+  ✅ Go (`docs/reviews/phase3f-firewall-go.md`). In-memory/per-instance MVP.
+
+### Deferred from firewall reviews (tracked)
+- ⬜ Cross-replica shared store (Phase 2R) — removes the per-instance N× / kill-
+  not-global limitation; makes the guarantee hold at scale.
+- ⬜ Nonce-robust / structural-prefix loop detection (beyond exact-hash).
+- ⬜ Require auth for firewall enforcement to be meaningful (auth-off = dev only).
+- ⬜ Tokenizer-based cost/token estimate (replace the chars/4 heuristic).
 
 ## Phase 4F — Provider-quota brokering
 - ⬜ Schedule/prioritize/queue requests against a known shared provider rate

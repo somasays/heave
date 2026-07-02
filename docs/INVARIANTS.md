@@ -70,20 +70,26 @@ success. It fails over only on *retryable* errors — transport failures/timeout
 provider. *Why:* retrying a doomed request across providers wastes latency and
 money and can mask a real client bug.
 
-**#9 — Enforcement is real-time, pre-vendor, and hard (the wedge).** heave's
-reason to exist is being the enforcement point for agentic spend and provider
-quota: controls that stop damage *before* a vendor is billed, with correctness
-guarantees — not after-the-fact dashboards or monthly caps. This generalizes the
-reserve/settle machinery (Invariant #7) from a monthly budget to short time
-constants and run scope: **token-velocity caps** ($/min per key/run), **per-run
-kill switches**, **loop/anomaly detection** (repeated near-identical prefixes =
-a runaway agent), **concurrency caps**, and **provider-quota brokering**
-(schedule/prioritize against a shared provider rate limit instead of merely
-failing over after a 429). *Why:* a runaway agent burns five figures in hours —
-a monthly budget is the wrong time constant, and "failover after 429" doesn't
-arbitrate a quota ten teams share. This is the acute, underserved pain where
-heave's pre-vendor / reserve-settle / Go-data-plane DNA is a real advantage
-rather than a re-implementation of LiteLLM.
+**#9 — Enforcement is real-time and pre-vendor (the wedge).** heave's reason to
+exist is being the enforcement point for agentic spend and provider quota:
+controls that stop damage *before* a vendor is billed — not after-the-fact
+dashboards or monthly caps. This generalizes the reserve/settle machinery
+(Invariant #7) from a monthly budget to short time constants and run scope:
+**velocity caps** ($/min and tokens/min per key/run, *reserved* at admit so
+concurrent requests cannot overshoot), **per-run kill switches**,
+**repeated-prompt detection** (a run resending the same prompt over a sliding
+window is likely a runaway — exact-hash, so a per-turn nonce defeats it; a
+heuristic, not a security control), **concurrency caps**, and (Phase 4F)
+**provider-quota brokering**. Run scope is namespaced by the authenticated key,
+so a spoofed `X-Heave-Run-Id` cannot kill or poison another caller's run. *Why:*
+a runaway agent burns five figures in hours — a monthly budget is the wrong time
+constant, and "failover after 429" doesn't arbitrate a shared quota. This is the
+acute, underserved pain where heave's pre-vendor / reserve-settle / Go-data-plane
+DNA is a real advantage over re-implementing LiteLLM. *Caveats:* enforcement is
+**per-instance** — N replicas allow N× each cap and a kill on one replica doesn't
+stop the run on others until the shared store lands (Phase 2R); and it is only
+meaningful with **auth enabled** (with auth off the scope key derives from
+client-controlled input — dev only).
 
 ---
 
@@ -239,6 +245,7 @@ Fail-cheap ordering inside `scripts/check.sh`: gofmt → architecture grep → b
 | #6 config is data | `config` validation + review |
 | #7 controls before vendor | `controls`/`server` tests (auth/rate/budget/redaction) + `depguard` (controls-/redact-pure) |
 | #8 failover only on retryable, health-gated | `health` tests + `server` failover tests + `depguard` (health-pure) |
+| #9 real-time pre-vendor firewall (the wedge) | `firewall` tests (velocity/kill/loop/concurrency) + `server` tests (kill endpoint, loop auto-kill, velocity 429) + `depguard` (firewall-pure) |
 | #A2 composition root / #A3 interface ownership | `depguard` + review |
 | #A4 no global mutable state | `gochecknoglobals` |
 | #A5 context propagation | `noctx` + review |

@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/somasays/heave/internal/controls"
+	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/openai"
@@ -35,6 +37,7 @@ type Server struct {
 	guard          *controls.Guard
 	health         *health.Tracker
 	redactor       *redact.Redactor
+	firewall       *firewall.Firewall
 	log            *slog.Logger
 	maxRequestBody int64
 	requestTimeout time.Duration
@@ -48,6 +51,7 @@ type Deps struct {
 	Guard     *controls.Guard
 	Health    *health.Tracker
 	Redactor  *redact.Redactor
+	Firewall  *firewall.Firewall
 	Log       *slog.Logger
 }
 
@@ -76,6 +80,9 @@ func New(d Deps, opts Options) *Server {
 	if d.Redactor == nil {
 		d.Redactor = redact.New(false, nil)
 	}
+	if d.Firewall == nil {
+		d.Firewall = firewall.New(false, firewall.Limits{}, nil)
+	}
 	if d.Log == nil {
 		d.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -86,6 +93,7 @@ func New(d Deps, opts Options) *Server {
 		guard:          d.Guard,
 		health:         d.Health,
 		redactor:       d.Redactor,
+		firewall:       d.Firewall,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
 		requestTimeout: opts.RequestTimeout,
@@ -96,9 +104,33 @@ func New(d Deps, opts Options) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("POST /v1/runs/{run_id}/kill", s.handleKillRun)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	return mux
+}
+
+// handleKillRun hard-stops an agent run: every subsequent request on it is
+// rejected. Requires a valid API key when auth is enabled.
+func (s *Server) handleKillRun(w http.ResponseWriter, r *http.Request) {
+	client, err := s.guard.Admit(bearerToken(r))
+	if err != nil {
+		s.denied(w, nil, err)
+		return
+	}
+	runID := r.PathValue("run_id")
+	if runID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "run_id is required")
+		return
+	}
+	// A caller can only kill its own runs (scoped by the authenticated key).
+	ownerKey := ""
+	if client != nil {
+		ownerKey = client.Name
+	}
+	s.firewall.Kill(ownerKey, runID)
+	s.log.Warn("run killed", "run_id", runID, "owner", ownerKey)
+	writeJSON(w, http.StatusOK, map[string]any{"killed": runID})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -167,14 +199,29 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	primary := candidates[0]
 
+	estUSD, estTokens := maxEstimate(&req, candidates)
+
 	// Reserve against the MAX estimated cost across the candidate chain (a
 	// pricier fallback must not let a client slip past its budget), BEFORE
 	// dispatch, so concurrent requests cannot all pass and overshoot the cap.
-	reservation, err := s.guard.Reserve(client, maxEstimateUSD(&req, candidates))
+	reservation, err := s.guard.Reserve(client, estUSD)
 	if err != nil {
 		s.denied(w, client, err)
 		return
 	}
+
+	// Firewall (Invariant #9): pre-vendor velocity / concurrency / kill / loop
+	// enforcement, scoped to the client key and the agent run. The estimate is
+	// reserved (held in the window) and reconciled by Settle on success.
+	fwKey := userName(client, &req)
+	runID := strings.TrimSpace(r.Header.Get("X-Heave-Run-Id"))
+	ticket, ferr := s.firewall.Enter(fwKey, runID, promptHash(&req), estUSD, estTokens)
+	if ferr != nil {
+		s.guard.Settle(reservation, 0)
+		s.firewallDenied(w, fwKey, runID, ferr)
+		return
+	}
+	defer ticket.Release()
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancel()
@@ -233,6 +280,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	cost := ledger.Cost(presp.InputTokens, presp.OutputTokens, presp.CacheReadInputTokens, presp.CacheWriteInputTokens,
 		used.Price.InputPerMTok, used.Price.OutputPerMTok)
 	s.guard.Settle(reservation, cost)
+	ticket.Settle(cost, presp.InputTokens+presp.OutputTokens)
 	s.ledger.Record(ledger.Record{
 		RequestID: requestID, Alias: used.Alias, Provider: used.Provider, Upstream: used.Upstream,
 		User: userName(client, &req), InputTokens: presp.InputTokens, OutputTokens: presp.OutputTokens,
@@ -247,6 +295,41 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Respond with the alias the client requested (primary); the header above
 	// carries the real upstream when it differs.
 	writeJSON(w, http.StatusOK, toOpenAIResponse(requestID, primary.Alias, presp))
+}
+
+// promptHash is a stable hash of the request's system + message content, used by
+// the firewall's loop detection (a run resending the same prompt is a runaway).
+func promptHash(req *openai.ChatCompletionRequest) string {
+	h := sha256.New()
+	for _, m := range req.Messages {
+		h.Write([]byte(m.Role))
+		h.Write([]byte{0})
+		h.Write([]byte(m.Content.Text))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// firewallDenied maps a firewall rejection to an HTTP status and logs it.
+func (s *Server) firewallDenied(w http.ResponseWriter, key, runID string, err error) {
+	var ve *firewall.VelocityError
+	var ce *firewall.ConcurrencyError
+	switch {
+	case errors.Is(err, firewall.ErrKilled):
+		s.log.Warn("request denied", "reason", "run_killed", "key", key, "run_id", runID)
+		writeError(w, http.StatusForbidden, "run_killed", "this run has been killed")
+	case errors.As(err, &ve):
+		s.log.Warn("request denied", "reason", "velocity_exceeded", "scope", ve.Scope, "key", key, "run_id", runID)
+		if ve.RetryAfterSec > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(ve.RetryAfterSec))
+		}
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "spend/token velocity limit exceeded")
+	case errors.As(err, &ce):
+		s.log.Warn("request denied", "reason", "concurrency_exceeded", "scope", ce.Scope, "key", key, "run_id", runID)
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "concurrency limit exceeded")
+	default:
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error", "request blocked by firewall")
+	}
 }
 
 // retryable reports whether a provider error warrants trying the next candidate.
@@ -306,10 +389,10 @@ func redactRequest(r *redact.Redactor, req *openai.ChatCompletionRequest) map[st
 	return total
 }
 
-// estimateCostUSD is an upper-bound cost for budget reservation: estimated input
-// tokens (rough chars/4) plus the resolved max output tokens, at the model's
-// price. Reconciled to the real cost by Settle after the response.
-func estimateCostUSD(preq *provider.Request, decision router.Decision) float64 {
+// estimate is an upper-bound cost (USD) and token count for a request on one
+// decision: estimated input tokens (rough chars/4) plus the resolved max output
+// tokens, at the model's price. Reconciled to the real values after the response.
+func estimate(preq *provider.Request, decision router.Decision) (usd float64, tokens int) {
 	chars := len(preq.System)
 	for _, m := range preq.Messages {
 		chars += len(m.Content)
@@ -319,19 +402,22 @@ func estimateCostUSD(preq *provider.Request, decision router.Decision) float64 {
 	if maxOut <= 0 {
 		maxOut = 4096
 	}
-	return ledger.Cost(estInput, maxOut, 0, 0, decision.Price.InputPerMTok, decision.Price.OutputPerMTok)
+	return ledger.Cost(estInput, maxOut, 0, 0, decision.Price.InputPerMTok, decision.Price.OutputPerMTok), estInput + maxOut
 }
 
-// maxEstimateUSD is the largest per-candidate cost estimate across the failover
-// chain, so the budget reservation covers whichever candidate ends up serving.
-func maxEstimateUSD(req *openai.ChatCompletionRequest, candidates []router.Decision) float64 {
-	max := 0.0
+// maxEstimate is the largest per-candidate USD and token estimate across the
+// failover chain, so reservations cover whichever candidate ends up serving.
+func maxEstimate(req *openai.ChatCompletionRequest, candidates []router.Decision) (usd float64, tokens int) {
 	for _, d := range candidates {
-		if e := estimateCostUSD(toProviderRequest(req, d), d); e > max {
-			max = e
+		u, t := estimate(toProviderRequest(req, d), d)
+		if u > usd {
+			usd = u
+		}
+		if t > tokens {
+			tokens = t
 		}
 	}
-	return max
+	return usd, tokens
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>" header,

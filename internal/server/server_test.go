@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/somasays/heave/internal/controls"
+	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/openai"
@@ -347,6 +348,69 @@ func TestServedProviderHeader(t *testing.T) {
 	rr := post(srv.Handler(), `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
 	if rr.Header().Get("X-Heave-Provider") != "fake" || rr.Header().Get("X-Heave-Upstream") != "up-x" {
 		t.Fatalf("served-provider headers missing: %v", rr.Header())
+	}
+}
+
+func firewallServer(t *testing.T, limits firewall.Limits) http.Handler {
+	t.Helper()
+	rtr := router.New([]router.ModelConfig{{
+		Alias: "m", Provider: "fake", Upstream: "u", Price: router.Price{InputPerMTok: 1, OutputPerMTok: 5},
+	}}, "m")
+	fp := &fakeProvider{resp: &provider.Response{Content: "ok", InputTokens: 1000, OutputTokens: 1000}}
+	srv := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"fake": fp}, Firewall: firewall.New(true, limits, nil)},
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
+	return srv.Handler()
+}
+
+func chatWithRun(h http.Handler, runID string) *httptest.ResponseRecorder {
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if runID != "" {
+		req.Header.Set("X-Heave-Run-Id", runID)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestKillEndpointBlocksRun(t *testing.T) {
+	h := firewallServer(t, firewall.Limits{})
+	// Kill run "r1".
+	kreq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/runs/r1/kill", nil)
+	krr := httptest.NewRecorder()
+	h.ServeHTTP(krr, kreq)
+	if krr.Code != 200 {
+		t.Fatalf("kill endpoint: want 200, got %d", krr.Code)
+	}
+	if rr := chatWithRun(h, "r1"); rr.Code != http.StatusForbidden {
+		t.Fatalf("killed run must be 403, got %d", rr.Code)
+	}
+	if rr := chatWithRun(h, "r2"); rr.Code != 200 {
+		t.Fatalf("other run must still work, got %d", rr.Code)
+	}
+}
+
+func TestLoopAutoKillViaHandler(t *testing.T) {
+	h := firewallServer(t, firewall.Limits{LoopThreshold: 3})
+	codes := []int{}
+	for i := 0; i < 3; i++ {
+		codes = append(codes, chatWithRun(h, "loopy").Code)
+	}
+	if codes[2] != http.StatusForbidden {
+		t.Fatalf("3rd identical prompt on a run should be 403 (auto-killed), got %v", codes)
+	}
+}
+
+func TestVelocityReturns429(t *testing.T) {
+	// First request costs ~$0.006 (1000 in @ $1/Mtok + 1000 out @ $5/Mtok);
+	// cap is $0.005/min, so the second request is over the window.
+	h := firewallServer(t, firewall.Limits{MaxUSDPerMin: 0.005})
+	if rr := chatWithRun(h, "run"); rr.Code != 200 {
+		t.Fatalf("first request should pass, got %d", rr.Code)
+	}
+	rr := chatWithRun(h, "run")
+	if rr.Code != http.StatusTooManyRequests || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("velocity cap should 429 with Retry-After, got %d ra=%q", rr.Code, rr.Header().Get("Retry-After"))
 	}
 }
 

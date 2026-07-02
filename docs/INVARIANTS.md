@@ -216,7 +216,7 @@ Fail-cheap ordering inside `scripts/check.sh`: gofmt → architecture grep → b
 |---|---|
 | #1 ingress format / #A1 layering | `depguard` (per-layer rules) + review |
 | #2 vendors only in provider / #S1 no secrets | `scripts/check_arch.sh` (grep) |
-| #3 routing through router | review (structural today; behavioral in Phase 2 benchmarks) |
+| #3 routing through router / cache-aware wedge | review; quantified by `internal/cachebench` (deterministic savings sim, `make bench`) + `internal/cache` (state store) tests |
 | #4 secrets from env | `check_arch.sh` + `.gitignore` |
 | #5 every request accounted | `server`/`ledger` tests + review |
 | #6 config is data | `config` validation + review |

@@ -31,6 +31,10 @@ test: ## Run tests only
 smoke: ## Run LIVE smoke tests against real provider APIs (needs API keys; costs money)
 	@go test -tags live -run Live -count=1 ./...
 
+.PHONY: bench
+bench: ## Run the cache-aware routing cost simulation (deterministic, offline)
+	@go run ./cmd/cachebench
+
 .PHONY: hooks
 hooks: ## Install the versioned git hooks (pre-commit + commit-msg)
 	@git config core.hooksPath .githooks

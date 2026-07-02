@@ -66,11 +66,30 @@ Invariant: Phase gate).
   calls, key-gated, never in the blocking gate.
 
 ## Phase 2 — Cache-aware routing (the wedge)
-- ⬜ Redis cache-state store (per-conversation model/prefix_hash/last_seen/ttl).
-- ⬜ Router pins to warm-cache model; re-route only on TTL lapse.
-- ⬜ Prefix-stability helper (append-only history, stable tool/system order).
-- ⬜ Benchmark harness proving savings vs naive routing (this is the marketing).
-- Reviews: ⬜ LLM-apps · ⬜ Go
+### Spike (option A): prove the thesis — DONE
+- ✅ In-memory cache-state store (`internal/cache`: per-conversation warm model,
+  TTL, prefix-hash conversation key).
+- ✅ Deterministic benchmark (`internal/cachebench`, `cmd/cachebench`, `make
+  bench`), faithful cost model (per-model partial cache hits + TTL, min-cache
+  floor, 1.25× write premium). Documented in `docs/BENCHMARK.md`.
+- **Result (honest, post-review):** cache-aware is **~10–13% cheaper** on the
+  default multi-turn workload — NOT the ~27% the first over-simplified model
+  showed — and the win is **concentrated in long conversations**: cache-aware
+  costs *more* on ~60% of conversations. → apply selectively (long/large-prefix
+  traffic), not globally.
+- Reviews (spike): ✅ cost-model honesty (`docs/reviews/phase2-spike-costmodel.md`,
+  OVERSTATED→corrected) · ✅ Go (`docs/reviews/phase2-spike-go.md`).
+- **Decision:** the wedge is real but modest; org-grade build is justified for
+  long-multi-turn/agentic traffic. Proceed to option B when ready.
+
+### Org-grade build (option B) — next, gated on the spike result
+- ⬜ Shared state store (Redis) for cache-state AND budgets/rate/health (fixes
+  the N×-per-instance problem at the same time).
+- ⬜ Streaming (SSE) — the wedge's value lives in interactive/agentic traffic.
+- ⬜ Wire cache-aware selection into the live request path (an "auto" alias with
+  a candidate pool + difficulty scorer); degrade to stateless if Redis is down.
+- ⬜ Prefix-stability helper (append-only history, stable tool/system order);
+  reconcile with redaction (which mutates the prefix).
 
 ## Phase 3 — Spend visibility
 - ⬜ Postgres spend ledger (durable, attributed by org/team/user/key).

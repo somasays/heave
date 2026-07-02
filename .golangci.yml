@@ -60,6 +60,16 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/redact must stay pure (no other internal packages)"
+        cache-pure:
+          files: ["**/internal/cache/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/cache must stay pure (no other internal packages)"
+        cachebench-pure:
+          files: ["**/internal/cachebench/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/cachebench must stay pure (no other internal packages)"
 
         # The provider boundary faces outward (vendors) only. It must not depend
         # on the core inward, so failover/redaction/cost logic can wrap it later.
@@ -90,6 +100,13 @@ linters:
       rules:
         - name: package-comments
         - name: exported
+
+  exclusions:
+    rules:
+      # The cachebench CLI is a report tool whose job is stdout; structured
+      # logging (the forbidigo rule) is for the library/request path, not here.
+      - path: cmd/cachebench/
+        linters: [forbidigo]
 
 formatters:
   enable:

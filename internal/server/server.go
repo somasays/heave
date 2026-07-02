@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/somasays/heave/internal/broker"
 	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
@@ -38,6 +39,7 @@ type Server struct {
 	health         *health.Tracker
 	redactor       *redact.Redactor
 	firewall       *firewall.Firewall
+	broker         *broker.Broker
 	log            *slog.Logger
 	maxRequestBody int64
 	requestTimeout time.Duration
@@ -52,6 +54,7 @@ type Deps struct {
 	Health    *health.Tracker
 	Redactor  *redact.Redactor
 	Firewall  *firewall.Firewall
+	Broker    *broker.Broker
 	Log       *slog.Logger
 }
 
@@ -83,6 +86,9 @@ func New(d Deps, opts Options) *Server {
 	if d.Firewall == nil {
 		d.Firewall = firewall.New(false, firewall.Limits{}, nil)
 	}
+	if d.Broker == nil {
+		d.Broker = broker.New(nil, nil) // inert (no shared store / no limits)
+	}
 	if d.Log == nil {
 		d.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -94,6 +100,7 @@ func New(d Deps, opts Options) *Server {
 		health:         d.Health,
 		redactor:       d.Redactor,
 		firewall:       d.Firewall,
+		broker:         d.Broker,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
 		requestTimeout: opts.RequestTimeout,
@@ -166,6 +173,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		// Nonzero means the shared velocity/concurrency store was unreachable and
 		// caps degraded to unenforced (fail-open) for that many admits.
 		"firewall_scope_degraded": fw.ScopeDegraded,
+		// Provider-quota brokering admits that failed open (shared store unreachable).
+		"broker_scope_degraded": s.broker.Degraded(),
 	})
 }
 
@@ -285,40 +294,107 @@ type accounting struct {
 	estTokens    int
 }
 
-// runCandidates tries candidates in order, skipping unhealthy providers and
-// recording each failed attempt. attempt performs one dispatch (unary or
-// streaming); canFailover reports whether it is still safe to try the next
-// candidate (false once a stream has written bytes). It stops on success or a
-// terminal/no-longer-failover-able error.
+// dispatchResult is the outcome of trying a model's candidate providers in order.
+type dispatchResult struct {
+	resp          *provider.Response
+	used          router.Decision
+	served        bool // a provider returned success
+	attempted     bool // at least one provider was actually dispatched to
+	quotaBlocked  bool // at least one candidate was skipped for provider quota
+	retryAfterSec int  // Retry-After hint when quotaBlocked
+	lastErr       error
+}
+
+// runCandidates tries candidates in order, skipping unhealthy providers and any
+// provider that is at its brokered quota (ADR 0003 — a truthful pre-vendor
+// "full", not a vendor 429), recording each failed attempt. attempt performs one
+// dispatch; canFailover reports whether it is still safe to try the next candidate
+// (false once a stream has written bytes). It stops on success or a terminal
+// error.
 func (s *Server) runCandidates(
 	ctx context.Context, req *openai.ChatCompletionRequest, candidates []router.Decision, acct accounting,
 	attempt func(prov provider.Provider, d router.Decision) (*provider.Response, error),
 	canFailover func() bool,
-) (presp *provider.Response, used router.Decision, served, attempted bool, lastErr error) {
+) dispatchResult {
+	var r dispatchResult
 	for _, d := range candidates {
 		prov, ok := s.providers[d.Provider]
 		if !ok || !s.health.Healthy(d.Provider) {
 			continue
 		}
-		attempted = true
+		// Provider-quota brokering: reserve the vendor's shared RPM/TPM headroom
+		// BEFORE dispatch. If it's at its ceiling, skip to the next candidate (a
+		// quota-aware failover) rather than provoking the vendor's 429.
+		lease, admitted, retry := s.broker.Reserve(d.Provider, acct.estTokens)
+		if !admitted {
+			r.quotaBlocked = true
+			r.retryAfterSec = retry
+			s.log.Info("provider at brokered quota; trying next candidate",
+				"provider", d.Provider, "request_id", acct.requestID)
+			continue
+		}
+		r.attempted = true
 		resp, err := attempt(prov, d)
 		if err == nil {
+			// Reconcile the provider's TPM to actual (nil-safe). A usage-omitting
+			// backend reports zero usage though it DID consume the vendor's quota, so
+			// FAIL CLOSED to the estimate rather than zeroing the reservation (which
+			// would let the shared TPM ceiling be overshot) — mirrors recordSuccess.
+			actualTok := resp.InputTokens + resp.OutputTokens
+			if actualTok <= 0 {
+				actualTok = acct.estTokens
+			}
+			lease.Settle(actualTok)
 			s.health.RecordSuccess(d.Provider)
-			return resp, d, true, true, nil
+			r.resp, r.used, r.served = resp, d, true
+			return r
 		}
-		lastErr = err
+		// canFailover() is false once a stream has written bytes — i.e. the vendor
+		// was actually engaged and billed us. In that case KEEP the provider-quota
+		// reservation counted (fail closed, like the firewall); only a request that
+		// never billed the vendor releases its reservation.
+		canFO := canFailover()
+		if canFO {
+			lease.Release()
+		} else {
+			lease.Settle(acct.estTokens)
+		}
+		r.lastErr = err
 		s.ledger.Record(ledger.Record{
 			RequestID: acct.requestID, Alias: d.Alias, Provider: d.Provider, Upstream: d.Upstream,
 			User: userName(acct.client, req), LatencyMS: time.Since(acct.start).Milliseconds(), Status: "error",
 		})
-		if ctx.Err() != nil || !retryable(err) || !canFailover() {
+		if ctx.Err() != nil || !retryable(err) || !canFO {
 			break
 		}
 		if !isRateLimited(err) {
 			s.health.RecordFailure(d.Provider)
 		}
 	}
-	return nil, router.Decision{}, false, attempted, lastErr
+	return r
+}
+
+// writeNoServe maps a non-served dispatch to the right status: 429 when every
+// candidate was at its brokered quota (nothing dispatched), 503 when no provider
+// was reachable, else the classified upstream error.
+func (s *Server) writeNoServe(ctx context.Context, w http.ResponseWriter, r dispatchResult) {
+	if r.quotaBlocked && !r.attempted {
+		if r.retryAfterSec > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(r.retryAfterSec))
+		}
+		writeError(w, http.StatusTooManyRequests, "rate_limit_error",
+			"no provider with available quota for this model; retry shortly")
+		return
+	}
+	if !r.attempted {
+		writeError(w, http.StatusServiceUnavailable, "api_error", "no healthy provider available for this model")
+		return
+	}
+	status, typ, msg, retryAfter := classifyError(ctx, r.lastErr)
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	writeError(w, status, typ, msg)
 }
 
 // recordSuccess settles the budget/firewall reservations and logs the billable
@@ -349,29 +425,21 @@ func (s *Server) recordSuccess(req *openai.ChatCompletionRequest, acct accountin
 }
 
 func (s *Server) serveUnary(ctx context.Context, w http.ResponseWriter, req *openai.ChatCompletionRequest, candidates []router.Decision, acct accounting) {
-	presp, used, served, attempted, lastErr := s.runCandidates(ctx, req, candidates, acct,
+	r := s.runCandidates(ctx, req, candidates, acct,
 		func(prov provider.Provider, d router.Decision) (*provider.Response, error) {
 			return prov.ChatCompletion(ctx, toProviderRequest(req, d))
 		},
 		func() bool { return true })
 
-	if !served {
+	if !r.served {
 		s.guard.Settle(acct.reservation, 0)
-		if !attempted {
-			writeError(w, http.StatusServiceUnavailable, "api_error", "no healthy provider available for this model")
-			return
-		}
-		status, typ, msg, retryAfter := classifyError(ctx, lastErr)
-		if retryAfter != "" {
-			w.Header().Set("Retry-After", retryAfter)
-		}
-		writeError(w, status, typ, msg)
+		s.writeNoServe(ctx, w, r)
 		return
 	}
-	s.recordSuccess(req, acct, used, presp)
-	w.Header().Set("X-Heave-Provider", used.Provider)
-	w.Header().Set("X-Heave-Upstream", used.Upstream)
-	writeJSON(w, http.StatusOK, toOpenAIResponse(acct.requestID, acct.primaryAlias, presp))
+	s.recordSuccess(req, acct, r.used, r.resp)
+	w.Header().Set("X-Heave-Provider", r.used.Provider)
+	w.Header().Set("X-Heave-Upstream", r.used.Upstream)
+	writeJSON(w, http.StatusOK, toOpenAIResponse(acct.requestID, acct.primaryAlias, r.resp))
 }
 
 func (s *Server) serveStreaming(ctx context.Context, w http.ResponseWriter, req *openai.ChatCompletionRequest, candidates []router.Decision, acct accounting) {
@@ -383,14 +451,14 @@ func (s *Server) serveStreaming(ctx context.Context, w http.ResponseWriter, req 
 	}
 	sw := &sseWriter{w: w, fl: fl, id: acct.requestID, model: acct.primaryAlias}
 
-	presp, used, served, attempted, lastErr := s.runCandidates(ctx, req, candidates, acct,
+	r := s.runCandidates(ctx, req, candidates, acct,
 		func(prov provider.Provider, d router.Decision) (*provider.Response, error) {
 			sw.setCandidate(d) // written as X-Heave-* headers on the first delta
 			return prov.ChatCompletionStream(ctx, toProviderRequest(req, d), sw.writeDelta)
 		},
 		func() bool { return !sw.wroteAny }) // can only fail over before the first byte
 
-	if !served {
+	if !r.served {
 		if sw.wroteAny {
 			// Bytes were already streamed (upstream failed mid-stream, or the
 			// client disconnected). The vendor billed us for what it generated, so
@@ -403,23 +471,15 @@ func (s *Server) serveStreaming(ctx context.Context, w http.ResponseWriter, req 
 				User: userName(acct.client, req), InputTokens: acct.estTokens,
 				CostUSD: acct.estUSD, LatencyMS: time.Since(acct.start).Milliseconds(), Status: "aborted",
 			})
-			sw.finishError(lastErr)
+			sw.finishError(r.lastErr)
 			return
 		}
 		s.guard.Settle(acct.reservation, 0)
-		if !attempted {
-			writeError(w, http.StatusServiceUnavailable, "api_error", "no healthy provider available for this model")
-			return
-		}
-		status, typ, msg, retryAfter := classifyError(ctx, lastErr)
-		if retryAfter != "" {
-			w.Header().Set("Retry-After", retryAfter)
-		}
-		writeError(w, status, typ, msg)
+		s.writeNoServe(ctx, w, r)
 		return
 	}
-	s.recordSuccess(req, acct, used, presp)
-	sw.finish(presp)
+	s.recordSuccess(req, acct, r.used, r.resp)
+	sw.finish(r.resp)
 }
 
 // promptHash is a stable hash of the request's system + message content, used by

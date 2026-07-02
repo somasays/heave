@@ -109,6 +109,14 @@ type Provider struct {
 	// APIKeyEnv names the environment variable holding the API key. The key
 	// itself is never written in config.
 	APIKeyEnv string `yaml:"api_key_env"`
+	// RateLimitRPM / RateLimitTPM are the vendor account's KNOWN shared quota
+	// (requests / tokens per minute). When set AND firewall.redis_url is
+	// configured, the gateway brokers this quota PRE-vendor across replicas
+	// (Invariant #9, ADR 0003): it reserves headroom before dispatch and fails
+	// over to another provider — or returns 429 — instead of hitting the vendor's
+	// 429. 0 disables a dimension. Ignored without a shared store.
+	RateLimitRPM int `yaml:"rate_limit_rpm"`
+	RateLimitTPM int `yaml:"rate_limit_tpm"`
 }
 
 // Model is one client-facing routable model.
@@ -187,6 +195,9 @@ func (c *Config) validate() error {
 		}
 		if provNames[p.Name] {
 			return fmt.Errorf("config: duplicate provider name %q", p.Name)
+		}
+		if p.RateLimitRPM < 0 || p.RateLimitTPM < 0 {
+			return fmt.Errorf("config: provider %q rate limits must be >= 0", p.Name)
 		}
 		provNames[p.Name] = true
 	}

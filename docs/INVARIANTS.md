@@ -82,9 +82,13 @@ cap), **per-run kill switches** (manual + auto), **repeated-prompt detection** (
 run resending the same prompt over a sliding window is likely a runaway —
 exact-hash, so a per-turn nonce or a growing context defeats it; a heuristic, not
 a security control — the per-run $ budget is the backstop for runaways it cannot
-see), **concurrency caps**, and (Phase 4F) **provider-quota brokering**. Run scope
-is namespaced by the authenticated key, so a spoofed `X-Heave-Run-Id` cannot kill
-or poison another caller's run. *Why:*
+see), **concurrency caps**, and **provider-quota brokering** (reserve a vendor's
+known shared RPM/TPM *before* dispatch and fail over to a provider with headroom —
+or return 429 + Retry-After — rather than reacting to the vendor's own 429; ADR
+0003. It *reduces*, does not eliminate, vendor 429s: the TPM reservation uses the
+token estimate, whose input side is not a strict upper bound). Run scope is
+namespaced by the authenticated key, so a spoofed `X-Heave-Run-Id` cannot kill or
+poison another caller's run. *Why:*
 a runaway agent burns five figures in hours — a monthly budget is the wrong time
 constant, and "failover after 429" doesn't arbitrate a shared quota. This is the
 acute, underserved pain where heave's pre-vendor / reserve-settle / Go-data-plane

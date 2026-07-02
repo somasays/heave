@@ -171,9 +171,19 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
 - ⬜ Tokenizer-based cost/token estimate (replace the chars/4 heuristic).
 
 ## Phase 4F — Provider-quota brokering
-- ⬜ Schedule/prioritize/queue requests against a known shared provider rate
-  limit instead of merely failing over after a 429 (the multi-team quota-fight
-  pain no incumbent solves well).
+- ✅ **Quota-aware failover** (ADR 0003) — reserve a provider's known shared
+  RPM/TPM PRE-vendor (reusing the ADR-0002 atomic scope store: RPM→count
+  dimension, TPM→tokens); if a provider is at its ceiling, skip to the next
+  candidate; if all are exhausted, return **429 + Retry-After** (a truthful "quota
+  full", never a provoked vendor 429). `internal/broker` (pure; injected store).
+  Requires the shared store (a global limit can't be brokered per-instance);
+  inert without it. Fails open. Unit tests (fake store) + server integration
+  (failover, 429, **cross-replica RPM=2 → 2 served across 2 replicas**). Reviews:
+  ✅ Go (`docs/reviews/phase4f-broker-go.md`) · ✅ security
+  (`docs/reviews/phase4f-broker-security.md`).
+- ⬜ Deferred: bounded admission **queuing** (hold a request briefly for headroom
+  vs. reject); **priority / fair-share** weighting across teams; a provider
+  concurrency dimension; single-node local fast path.
 
 ## Phase 5 — Attribution & visibility (was "spend dashboard")
 - ⬜ Durable ledger (Postgres) attributed by org/team/key/**run**.

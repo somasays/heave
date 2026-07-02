@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/somasays/heave/internal/broker"
 	"github.com/somasays/heave/internal/config"
 	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/firewall"
@@ -95,6 +96,7 @@ func run(configPath string, log *slog.Logger) error {
 		MaxUSDPerRun:    cfg.Firewall.MaxUSDPerRun,
 		KillTTL:         killTTL,
 	}, nil)
+	var sharedStore *redisstore.Store
 	if cfg.Firewall.RedisURL != "" {
 		store, err := redisstore.New(cfg.Firewall.RedisURL, killTTL)
 		if err != nil {
@@ -112,7 +114,28 @@ func run(configPath string, log *slog.Logger) error {
 		}
 		fw.WithKillStore(store)
 		fw.WithScopeStore(store)
+		sharedStore = store
 		log.Info("firewall kill state + velocity/concurrency shared via redis")
+	}
+
+	// Provider-quota broker (Invariant #9, ADR 0003): active only with a shared
+	// store, since a provider limit is global and per-instance brokering would be
+	// N× the real ceiling.
+	provLimits := make(map[string]broker.Limit, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		if p.RateLimitRPM > 0 || p.RateLimitTPM > 0 {
+			provLimits[p.Name] = broker.Limit{RPM: p.RateLimitRPM, TPM: p.RateLimitTPM}
+		}
+	}
+	var qb *broker.Broker
+	if sharedStore != nil && len(provLimits) > 0 {
+		qb = broker.New(sharedStore, provLimits)
+		log.Info("provider-quota brokering enabled", "providers", len(provLimits))
+	} else {
+		qb = broker.New(nil, nil) // inert
+		if len(provLimits) > 0 {
+			log.Warn("provider rate limits are configured but brokering is OFF (needs firewall.redis_url); relying on failover-after-429")
+		}
 	}
 	if fw.Enabled() {
 		log.Info("spend/quota firewall enabled",
@@ -128,7 +151,7 @@ func run(configPath string, log *slog.Logger) error {
 
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
-		Health: tracker, Redactor: redactor, Firewall: fw, Log: log,
+		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,

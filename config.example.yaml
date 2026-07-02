@@ -19,6 +19,13 @@ providers:
     type: openai
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
+    # Known vendor account quota. When set AND firewall.redis_url is configured,
+    # the gateway brokers this shared limit pre-vendor across replicas (ADR 0003):
+    # it reserves headroom before dispatch and fails over to another provider — or
+    # returns 429 + Retry-After — instead of hitting the vendor's 429. Ignored
+    # without a shared store (a global limit can't be brokered per-instance).
+    # rate_limit_rpm: 3500
+    # rate_limit_tpm: 900000
 
   # OpenRouter and other OpenAI-compatible vendors reuse the "openai" type:
   # - name: openrouter

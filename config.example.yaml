@@ -113,10 +113,11 @@ firewall:
                             # for changing-prompt runaways loop detection can't see. Not absolute
                             # (est-based, resets if the run idles out) — monthly_budget_usd is the
                             # absolute ceiling. 0 disables.
-  # Share run-kill state across replicas (a kill on one gateway stops the run on
-  # all). A kill is written to BOTH a local map and Redis, so a locally-issued
-  # kill still holds if Redis blips. Velocity/concurrency stay per-instance for
-  # now. Empty = single node (local map only).
+  # Share firewall state across replicas via Redis (ADR 0002): run-kills AND the
+  # velocity/concurrency caps become cluster-wide (N replicas honor one cap, not
+  # N×) via an atomic reserve/settle. Fails OPEN on a Redis outage (caps degrade
+  # to unenforced; see /metrics firewall_scope_degraded). Loop detection and
+  # max_usd_per_run stay per-instance. Empty = single node (local only).
   # redis_url: "redis://localhost:6379/0"
   # kill_ttl: 24h            # how long a kill is remembered (local + Redis TTL)
 

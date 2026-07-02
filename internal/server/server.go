@@ -163,6 +163,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"firewall_live_kills":         fw.LocalKills,
 		"firewall_kill_rejections":    fw.KillRejections,
 		"firewall_shared_kill_errors": fw.SharedKillErrors,
+		// Nonzero means the shared velocity/concurrency store was unreachable and
+		// caps degraded to unenforced (fail-open) for that many admits.
+		"firewall_scope_degraded": fw.ScopeDegraded,
 	})
 }
 

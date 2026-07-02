@@ -24,11 +24,34 @@ const opTimeout = 500 * time.Millisecond
 // as "never expire" — a leaked kill key that outlives its run forever.
 const fallbackTTL = 24 * time.Hour
 
-// Store is a Redis-backed KillStore.
+// Store is a Redis-backed shared store: run-kill state (KillStore) plus
+// cross-replica velocity/concurrency reserve/settle (see scopestore.go).
 type Store struct {
 	rdb *redis.Client
 	ttl time.Duration
+	// now overrides the scope-store clock (unix seconds) for tests; nil = wall.
+	now func() int64
+	// holdTTL bounds a concurrency hold's lifetime (seconds) before it is reaped
+	// as a crashed-replica leak; MUST exceed the longest request so a live hold is
+	// never reaped. Set from request_timeout by the composition root.
+	holdTTL int
+	// Scope-store Lua scripts, compiled once (EVALSHA-cached by go-redis).
+	reserveScript     *redis.Script
+	adjustScript      *redis.Script
+	releaseConcScript *redis.Script
 }
+
+// SetHoldTTL sets the concurrency-hold lifetime (seconds). Values below the
+// default floor are ignored, so a live request's hold is never reaped early.
+func (s *Store) SetHoldTTL(seconds int) {
+	if seconds > holdTTLSecs {
+		s.holdTTL = seconds
+	}
+}
+
+// SetClock injects the scope-store clock (unix seconds). Test-only; the wall
+// clock is used when unset.
+func (s *Store) SetClock(now func() int64) { s.now = now }
 
 // New connects to Redis from a URL (redis://host:port/db) and returns a Store
 // whose kills expire after ttl.
@@ -45,7 +68,12 @@ func NewClient(rdb *redis.Client, ttl time.Duration) *Store {
 	if ttl <= 0 {
 		ttl = fallbackTTL // never persist kill keys forever
 	}
-	return &Store{rdb: rdb, ttl: ttl}
+	return &Store{
+		rdb: rdb, ttl: ttl, holdTTL: holdTTLSecs,
+		reserveScript:     redis.NewScript(reserveSrc),
+		adjustScript:      redis.NewScript(adjustSrc),
+		releaseConcScript: redis.NewScript(releaseConcSrc),
+	}
 }
 
 func killKey(runKey string) string { return "heave:kill:" + runKey }

@@ -102,8 +102,9 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   streaming can't be a free firewall bypass. Reviews: ✅ Go
   (`docs/reviews/phase2r-streaming-go.md`) · ✅ SSE-compat
   (`docs/reviews/phase2r-streaming-compat.md`).
-- 🟡 **Shared state store (Redis)** — first primitive shipped: **shared run-kill
-  store**. `internal/redisstore` implements `firewall.KillStore` structurally
+- ✅ **Shared state store (Redis)** — **run-kill** + **velocity/concurrency** now
+  cross-replica (ADR 0002); the per-instance N× caveat is closed for these.
+  `internal/redisstore` implements `firewall.KillStore` structurally
   (firewall stays pure); kill state is layered (always-on local map + optional
   Redis), so a kill on one replica propagates to all AND a locally-issued kill
   survives a Redis blip. Reads fail open (availability); a kill that can't durably
@@ -113,8 +114,18 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   counts. Hermetic tests via miniredis (cross-instance, TTL, fail-open, cap).
   Reviews: ✅ security (`docs/reviews/phase2r-redis-security.md`, FAIL→fixed) ·
   ✅ Go (`docs/reviews/phase2r-redis-go.md`, PASS-with-nits→fixed).
-  - ⬜ Still per-instance (needs an atomic Redis reserve/settle):
-    budgets/rate/health/**velocity/concurrency**. Kill is the only shared piece.
+  - ✅ **Shared velocity + concurrency** (ADR 0002) — `internal/redisstore`
+    `ScopeStore`: the whole multi-scope check-and-reserve is one atomic Lua `EVAL`
+    (velocity = rolling-window hashes; concurrency = ZSET distributed semaphore
+    with crash-safe hold TTL). The firewall delegates when `redis_url` is set;
+    fails OPEN (counted as `firewall_scope_degraded`). Hermetic miniredis tests +
+    a cross-replica E2E (two servers, one Redis, one shared $/min cap — 2/6 served
+    vs ~4 per-instance). On a Redis outage it falls back to LOCAL enforcement
+    (bounded N×, never unenforced), counted as `firewall_scope_degraded`. Reviews:
+    ✅ Go (`docs/reviews/phase2r-scopestore-go.md`, FAIL→fixed) · ✅ security
+    (`docs/reviews/phase2r-scopestore-security.md`, PASS-with-nits→fixed).
+  - ⬜ Still per-instance: loop detection (local heuristic), `max_usd_per_run`
+    (mitigated by shared kills — first replica to trip stops the run everywhere).
   - ⬜ Deferred: cancel in-flight (streaming) requests on kill; durable/permanent
     kill beyond TTL; 1 MiB SSE line cap; byte-based settlement for aborted streams.
 

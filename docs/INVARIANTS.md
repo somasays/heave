@@ -97,9 +97,16 @@ gated**: reads fail OPEN, so during a Redis outage a *remotely*-issued kill is n
 seen on other replicas and that runaway keeps spending there until Redis recovers
 (the replica that issued the kill still enforces it locally). A kill stops
 *subsequent* requests on the run; it does not cancel an already-dispatched
-request (an in-flight stream runs to completion). Velocity and concurrency caps
-remain **per-instance** — N replicas allow N× each cap until their shared store
-lands (a follow-up needs an atomic Redis reserve/settle). The local kill map is
+request (an in-flight stream runs to completion). **Velocity and concurrency caps
+are shared** when `firewall.redis_url` is set (ADR 0002): the whole multi-scope
+check-and-reserve is one atomic Redis `EVAL`, so N replicas honor a single cap,
+not N× — concurrency is a distributed semaphore (crashed-replica holds reaped by
+TTL). They too FAIL OPEN on a Redis outage (caps degrade to unenforced, counted
+in `/metrics` as `firewall_scope_degraded`); the per-client monthly budget stays
+the absolute local ceiling. Loop detection and the per-run $ budget remain
+per-instance (the latter mitigated by shared kills — the first replica to trip it
+stops the run everywhere). Without Redis, all caps are per-instance (N×). The
+local kill map is
 size-capped: past the cap a new kill is *refused* (5xx), never satisfied by
 evicting a live kill; `/metrics` exposes rejection and propagation-failure counts.
 Enforcement scope is keyed to the **authenticated client** (empty when auth is

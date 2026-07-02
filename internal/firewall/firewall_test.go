@@ -364,6 +364,180 @@ func TestLoopTripSharedErrorIsObservable(t *testing.T) {
 	}
 }
 
+// fakeScopeStore is a controllable in-memory ScopeStore for the shared-mode tests.
+type fakeScopeStore struct {
+	mu        sync.Mutex
+	reserved  map[string]float64 // scope key -> reserved USD
+	holds     map[string]int     // scope key -> live holds
+	denyKind  string             // if set, Reserve denies with this kind
+	failErr   error              // if set, Reserve fails (fail-open path)
+	settleSum float64
+	releases  int
+}
+
+func newFakeScopeStore() *fakeScopeStore {
+	return &fakeScopeStore{reserved: map[string]float64{}, holds: map[string]int{}}
+}
+
+func (s *fakeScopeStore) Reserve(keys, names []string, _ []float64, _, _ []int, estUSD float64, _ int, _ string) (bool, string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failErr != nil {
+		return true, "", "", s.failErr
+	}
+	if s.denyKind != "" {
+		return false, names[0], s.denyKind, nil
+	}
+	for _, k := range keys {
+		s.reserved[k] += estUSD
+		s.holds[k]++
+	}
+	return true, "", "", nil
+}
+
+func (s *fakeScopeStore) Settle(_ []string, deltaUSD float64, _ int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settleSum += deltaUSD
+	return nil
+}
+
+func (s *fakeScopeStore) Release(keys []string, _ string, estUSD float64, _ int, settled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releases++
+	for _, k := range keys {
+		if s.holds[k] > 0 {
+			s.holds[k]--
+		}
+		if !settled {
+			s.reserved[k] -= estUSD
+		}
+	}
+	return nil
+}
+
+// TestSharedModeDelegatesToScopeStore: with a ScopeStore, velocity/concurrency go
+// to the store; Settle/Release propagate to it.
+func TestSharedModeDelegatesToScopeStore(t *testing.T) {
+	store := newFakeScopeStore()
+	f := New(true, Limits{MaxUSDPerMin: 100}, nil).WithScopeStore(store)
+	tk, err := f.Enter("k", "r", "h", 0.5, 0)
+	if err != nil {
+		t.Fatalf("store admits, Enter must succeed: %v", err)
+	}
+	if store.reserved["key:k"] != 0.5 || store.holds["key:k"] != 1 {
+		t.Fatalf("Enter must reserve in the shared store, got %+v", store.reserved)
+	}
+	tk.Settle(0.3, 0)
+	tk.Release()
+	if store.settleSum != 0.3-0.5 { // reconcile delta actual-est
+		t.Fatalf("Settle must reconcile to the store, got %v", store.settleSum)
+	}
+	if store.releases != 1 {
+		t.Fatalf("Release must free the store hold, got %d", store.releases)
+	}
+}
+
+// TestSharedVelocityDenialRollsBackBudget: a store velocity denial must roll back
+// the local per-run budget reservation (no partial state).
+func TestSharedVelocityDenialRollsBackBudget(t *testing.T) {
+	store := newFakeScopeStore()
+	f := New(true, Limits{MaxUSDPerMin: 100, MaxUSDPerRun: 1.0}, nil).WithScopeStore(store)
+	store.denyKind = "velocity"
+	if _, err := f.Enter("k", "r", "h1", 0.4, 0); !errors.As(err, new(*VelocityError)) {
+		t.Fatalf("store velocity denial must surface as VelocityError, got %v", err)
+	}
+	// The budget reserve was rolled back: a fresh 0.9 (which would trip if 0.4 had
+	// stuck) must still admit.
+	store.denyKind = ""
+	if tk, err := f.Enter("k", "r", "h2", 0.9, 0); err != nil {
+		t.Fatalf("denied reserve must not consume the per-run budget, got %v", err)
+	} else {
+		tk.Release()
+	}
+}
+
+// TestSharedConcurrencyDenial maps a store concurrency breach to ConcurrencyError.
+func TestSharedConcurrencyDenial(t *testing.T) {
+	store := newFakeScopeStore()
+	store.denyKind = "concurrency"
+	f := New(true, Limits{MaxConcurrent: 1}, nil).WithScopeStore(store)
+	if _, err := f.Enter("k", "r", "h", 0, 0); !errors.As(err, new(*ConcurrencyError)) {
+		t.Fatalf("store concurrency denial must surface as ConcurrencyError, got %v", err)
+	}
+}
+
+// TestSharedFailOpenCountsDegraded: a store error admits (availability) and is
+// counted so the degradation is observable.
+func TestSharedFailOpenCountsDegraded(t *testing.T) {
+	store := newFakeScopeStore()
+	store.failErr = errors.New("redis down")
+	f := New(true, Limits{MaxUSDPerMin: 0.0001}, nil).WithScopeStore(store)
+	tk, err := f.Enter("k", "r", "h", 999.0, 0) // would exceed if enforced
+	if err != nil {
+		t.Fatalf("a store outage must fail OPEN, got %v", err)
+	}
+	tk.Settle(999.0, 0)
+	tk.Release()
+	if f.Stats().ScopeDegraded == 0 {
+		t.Fatal("a failed-open admit must be observable via Stats")
+	}
+	// MF-1 regression: nothing was written to the store on a fail-open admit, so
+	// Settle/Release must NOT touch it — otherwise they'd subtract a phantom
+	// reservation and erode co-tenants' real reservations.
+	if store.releases != 0 || store.settleSum != 0 {
+		t.Fatalf("fail-open ticket must be a store no-op, got releases=%d settle=%v", store.releases, store.settleSum)
+	}
+}
+
+// TestSharedFailOpenFallsBackToLocalEnforcement (review M3): when the shared
+// store errors, the firewall enforces LOCALLY (bounded per-instance) rather than
+// admitting everything — degrading to N×, never to unenforced.
+func TestSharedFailOpenFallsBackToLocalEnforcement(t *testing.T) {
+	store := newFakeScopeStore()
+	store.failErr = errors.New("redis down")
+	f := New(true, Limits{MaxUSDPerMin: 0.01}, nil).WithScopeStore(store)
+	admitted := 0
+	for i := 0; i < 5; i++ {
+		if tk, err := f.Enter("k", "", "", 0.006, 0); err == nil {
+			admitted++
+			tk.Settle(0.006, 0)
+			tk.Release()
+		}
+	}
+	if admitted == 5 {
+		t.Fatal("fail-open must fall back to LOCAL enforcement, not admit everything")
+	}
+	if admitted == 0 {
+		t.Fatal("local fallback must still admit within the local cap")
+	}
+	if f.Stats().ScopeDegraded == 0 {
+		t.Fatal("fail-open must be observable via Stats")
+	}
+}
+
+// TestSharedModeLoopAndKillStayLocal: loop detection and kills still work in
+// shared mode (they are local, not delegated).
+func TestSharedModeLoopAndKillStayLocal(t *testing.T) {
+	store := newFakeScopeStore()
+	f := New(true, Limits{MaxUSDPerMin: 100, LoopThreshold: 2}, nil).WithScopeStore(store)
+	if tk, err := f.Enter("k", "run", "same", 0, 0); err == nil {
+		tk.Release()
+	}
+	if _, err := f.Enter("k", "run", "same", 0, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("loop detection must still trip in shared mode, got %v", err)
+	}
+	// And a manual kill still blocks.
+	f2 := New(true, Limits{MaxUSDPerMin: 100}, nil).WithScopeStore(newFakeScopeStore())
+	if err := f2.Kill("k", "run2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f2.Enter("k", "run2", "h", 0, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("manual kill must still block in shared mode, got %v", err)
+	}
+}
+
 // TestPerRunBudgetAutoKills: a hard cumulative per-run $ cap trips a kill once the
 // run would exceed it — the backstop for changing-prompt runaways loop detection
 // can't catch. The run never bills past the cap, and stays killed afterward.

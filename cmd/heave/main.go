@@ -101,6 +101,9 @@ func run(configPath string, log *slog.Logger) error {
 			return fmt.Errorf("firewall redis: %w", err)
 		}
 		defer func() { _ = store.Close() }()
+		// Keep a concurrency hold alive longer than the longest request so a live
+		// hold is never reaped as a crash leak (over-admitting the concurrency cap).
+		store.SetHoldTTL(int(cfg.Server.RequestTimeout.Seconds()) + 60)
 		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		err = store.Ping(pingCtx)
 		cancel()
@@ -108,7 +111,8 @@ func run(configPath string, log *slog.Logger) error {
 			return fmt.Errorf("firewall redis unreachable: %w", err)
 		}
 		fw.WithKillStore(store)
-		log.Info("firewall kill state shared via redis")
+		fw.WithScopeStore(store)
+		log.Info("firewall kill state + velocity/concurrency shared via redis")
 	}
 	if fw.Enabled() {
 		log.Info("spend/quota firewall enabled",

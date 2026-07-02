@@ -22,10 +22,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/provider"
+	"github.com/somasays/heave/internal/redisstore"
 	"github.com/somasays/heave/internal/router"
 )
 
@@ -60,6 +63,61 @@ func newE2E(t *testing.T, fwEnabled bool, limits firewall.Limits) e2eEnv {
 		Guard: controls.New(true, clients, nil), Ledger: led, Firewall: fw,
 	}, Options{MaxRequestBytes: 1 << 20, RequestTimeout: 2 * time.Second})
 	return e2eEnv{h: srv.Handler(), fp: fp, led: led, fw: fw, key: key}
+}
+
+// newE2EShared is newE2E with the firewall's velocity/concurrency delegated to a
+// shared scope store (one replica of a multi-replica deployment).
+func newE2EShared(t *testing.T, limits firewall.Limits, store firewall.ScopeStore) e2eEnv {
+	t.Helper()
+	const key = "agent-key"
+	clients := []controls.Client{{Name: "agent", KeySHA256: sha(key)}}
+	led := ledger.New(discardLog())
+	fw := firewall.New(true, limits, nil).WithScopeStore(store)
+	rtr := router.New([]router.ModelConfig{{
+		Alias: "agent-model", Provider: "fake", Upstream: "up",
+		Price: router.Price{InputPerMTok: 1, OutputPerMTok: 5}, MaxOutputTokens: 4096, AcceptsSampling: true,
+	}}, "agent-model")
+	fp := &fakeProvider{resp: &provider.Response{Content: "ok", InputTokens: 1000, OutputTokens: 1000, FinishReason: "stop"}}
+	srv := newTestServer(t, Deps{
+		Router: rtr, Providers: map[string]provider.Provider{"fake": fp},
+		Guard: controls.New(true, clients, nil), Ledger: led, Firewall: fw,
+	}, Options{MaxRequestBytes: 1 << 20, RequestTimeout: 2 * time.Second})
+	return e2eEnv{h: srv.Handler(), fp: fp, led: led, fw: fw, key: key}
+}
+
+// TestE2E_VelocityCapHoldsAcrossReplicas is the ADR-0002 headline: two replicas
+// sharing one Redis honor a SINGLE $/min cap — closing the "per-instance N×"
+// caveat. Per-instance caps would let each replica serve the burst independently.
+func TestE2E_VelocityCapHoldsAcrossReplicas(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+	mkStore := func() *redisstore.Store {
+		s := redisstore.NewClient(redis.NewClient(&redis.Options{Addr: mr.Addr()}), time.Hour)
+		s.SetClock(func() int64 { return 1000 }) // shared fixed clock (one window)
+		return s
+	}
+	// est ≈ $0.005/call; a $0.013/min cap admits ~2 calls TOTAL across both replicas.
+	replicaA := newE2EShared(t, firewall.Limits{MaxUSDPerMin: 0.013}, mkStore())
+	replicaB := newE2EShared(t, firewall.Limits{MaxUSDPerMin: 0.013}, mkStore())
+
+	served := 0
+	for i := 0; i < 6; i++ {
+		env := replicaA
+		if i%2 == 1 {
+			env = replicaB
+		}
+		if env.send("", fmt.Sprintf("burst-%d", i)) == http.StatusOK {
+			served++
+		}
+	}
+	// Shared: ~2 served total. Per-instance would be ~4 (each replica serves ~2).
+	if served > 3 {
+		t.Fatalf("shared $/min cap must bound TOTAL served across replicas, got %d (per-instance would be ~4)", served)
+	}
+	t.Logf("shared $/min cap across 2 replicas: %d/6 served total (per-instance N× would be ~4)", served)
 }
 
 func (e e2eEnv) send(runID, prompt string) int {

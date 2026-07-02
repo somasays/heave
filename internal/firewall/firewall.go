@@ -26,6 +26,8 @@
 package firewall
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"sync"
@@ -121,6 +123,14 @@ type Firewall struct {
 	// auto path is still observable via /metrics.
 	sharedKillErrs atomic.Uint64
 
+	// scopeStore, when set, moves velocity + concurrency enforcement OFF local
+	// memory and into a shared (Redis) store so the caps hold across replicas
+	// (ADR 0002). Loop detection and the per-run $ budget stay local.
+	scopeStore ScopeStore
+	// scopeDegraded counts admits that failed OPEN because the shared scope store
+	// was unreachable (enforcement degraded to unenforced) — observable via Stats.
+	scopeDegraded atomic.Uint64
+
 	mu     sync.Mutex
 	scopes map[string]*scopeState
 	loops  map[string]*loopState
@@ -138,6 +148,9 @@ type Stats struct {
 	// SharedKillErrors counts shared-store write failures (kills that may not have
 	// propagated to other replicas).
 	SharedKillErrors uint64
+	// ScopeDegraded counts admits that failed OPEN because the shared velocity/
+	// concurrency store was unreachable (caps degraded to unenforced).
+	ScopeDegraded uint64
 }
 
 // KillStore is a shared run-kill store (e.g. Redis). Kill returns an error so a
@@ -147,6 +160,29 @@ type Stats struct {
 type KillStore interface {
 	Kill(runKey string) error
 	Killed(runKey string) bool
+}
+
+// ScopeStore is a shared, atomic velocity + concurrency reserve/settle store
+// (e.g. Redis), keeping the firewall pure via stdlib-only signatures. Reserve
+// checks and reserves ALL scopes atomically (all-or-nothing); on a cap breach it
+// returns admitted=false with the breached scope name + kind ("velocity" |
+// "concurrency"). It FAILS OPEN: on a store error it returns admitted=true and a
+// non-nil error so the caller can record the degradation. Settle reconciles a
+// reservation to actual spend; Release frees the concurrency hold (holdID) and,
+// if unsettled, the reserved estimate. Scopes are parallel slices (keys[i] has
+// caps maxUSD[i]/maxTokens[i]/maxInflight[i], display name names[i]).
+type ScopeStore interface {
+	Reserve(keys, names []string, maxUSD []float64, maxTokens, maxInflight []int, estUSD float64, estTokens int, holdID string) (admitted bool, deniedName, deniedKind string, err error)
+	Settle(keys []string, deltaUSD float64, deltaTokens int) error
+	Release(keys []string, holdID string, estUSD float64, estTokens int, settled bool) error
+}
+
+// newHoldID returns a globally-unique concurrency-hold id (crypto-random, so it
+// cannot collide across replicas sharing one store).
+func newHoldID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 type scopeState struct {
@@ -196,6 +232,16 @@ func (f *Firewall) WithKillStore(ks KillStore) *Firewall {
 	return f
 }
 
+// WithScopeStore moves velocity + concurrency enforcement into a shared store
+// (e.g. Redis) so the caps hold across replicas, and returns f. Only the
+// composition root (cmd) should call this, once, before serving.
+func (f *Firewall) WithScopeStore(ss ScopeStore) *Firewall {
+	if ss != nil {
+		f.scopeStore = ss
+	}
+	return f
+}
+
 // isKilled reports whether a run is killed per EITHER the local or shared store.
 // Callers must not hold f.mu: the shared store may do network I/O.
 func (f *Firewall) isKilled(runKey string) bool {
@@ -233,6 +279,7 @@ func (f *Firewall) Stats() Stats {
 		LocalKills:       local,
 		KillRejections:   rejects,
 		SharedKillErrors: f.sharedKillErrs.Load(),
+		ScopeDegraded:    f.scopeDegraded.Load(),
 	}
 }
 
@@ -317,14 +364,19 @@ func (f *Firewall) Enabled() bool { return f.enabled }
 // estimate to the actual spend.
 type Ticket struct {
 	fw        *Firewall
-	scopeKeys []string
+	scopeKeys []string // LOCAL-mode velocity/concurrency scopes (empty in shared mode)
 	// runScopeKey is the run scope's map key when a per-run budget is tracked
 	// ("" otherwise), so Settle/Release can reconcile the cumulative runUSD.
 	runScopeKey string
-	estUSD      float64
-	estTokens   int
-	released    bool
-	settled     bool
+	// store/storeKeys/holdID are set in SHARED mode: velocity/concurrency
+	// reserve/settle/release go to the cross-replica store keyed by holdID.
+	store     ScopeStore
+	storeKeys []string
+	holdID    string
+	estUSD    float64
+	estTokens int
+	released  bool
+	settled   bool
 }
 
 // Enter is the pre-vendor gate: kill/loop checks, then a velocity + concurrency
@@ -342,6 +394,12 @@ func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estToken
 	// must never be held under the global firewall lock.
 	if f.isKilled(runKey) {
 		return nil, ErrKilled
+	}
+
+	// Shared mode: velocity + concurrency go to the cross-replica store; loop
+	// detection and the per-run $ budget stay local.
+	if f.scopeStore != nil {
+		return f.enterShared(key, runID, runKey, promptHash, estUSD, estTokens)
 	}
 
 	ticket, tripped, err := f.enterLocked(key, runID, runKey, promptHash, estUSD, estTokens)
@@ -368,50 +426,185 @@ func (f *Firewall) enterLocked(key, runID, runKey, promptHash string, estUSD flo
 	now := f.now()
 	f.gcLocked(now)
 
-	if runKey != "" && f.limits.LoopThreshold > 0 && promptHash != "" &&
-		f.tripLoopLocked(runKey, promptHash, now) {
+	tripped, budgetKey := f.checkLoopBudgetLocked(runKey, promptHash, estUSD, now)
+	if tripped {
 		return nil, true, nil
 	}
+	mapKeys, verr := f.checkReserveScopesLocked(f.scopeKeys(key, runID), estUSD, estTokens, now)
+	if verr != nil {
+		f.unreserveBudgetLocked(budgetKey, estUSD) // roll back the budget reserved above
+		return nil, false, verr
+	}
+	return &Ticket{fw: f, scopeKeys: mapKeys, runScopeKey: budgetKey, estUSD: estUSD, estTokens: estTokens}, false, nil
+}
 
+// checkLoopBudgetLocked runs the LOCAL loop-detection + per-run-budget checks and,
+// if the budget applies, RESERVES the estimate against it. Returns tripped=true
+// when either fires (caller then kills), and the budget scope key (for reconcile/
+// rollback). Assumes f.mu is held.
+func (f *Firewall) checkLoopBudgetLocked(runKey, promptHash string, estUSD float64, now time.Time) (tripped bool, budgetKey string) {
+	if runKey != "" && f.limits.LoopThreshold > 0 && promptHash != "" &&
+		f.tripLoopLocked(runKey, promptHash, now) {
+		return true, ""
+	}
 	// Per-run cumulative budget: if this request would push the run over its hard
-	// $ cap, KILL the run (trip) — this is the backstop for runaways whose prompts
-	// keep changing, which loop detection cannot see.
+	// $ cap, KILL the run (trip) — the backstop for runaways whose prompts keep
+	// changing, which loop detection cannot see.
 	if runKey != "" && f.limits.MaxUSDPerRun > 0 {
 		spent := 0.0
 		if st := f.scopes[runKey]; st != nil {
 			spent = st.runUSD
 		}
 		if spent+estUSD > f.limits.MaxUSDPerRun {
-			return nil, true, nil
+			return true, ""
 		}
+		st := f.ensureScopeLocked(runKey, now)
+		st.runUSD += estUSD
+		return false, runKey
 	}
+	return false, ""
+}
 
-	keys := f.scopeKeys(key, runID)
-	// Check every scope first (all-or-nothing), then reserve.
+// checkReserveScopesLocked does the local velocity + concurrency check-all (all-or
+// -nothing) then reserve-all for the given scopes, returning the reserved map
+// keys. Assumes f.mu is held. This is the local enforcement shared by the normal
+// local path AND the shared-mode fallback when Redis is unreachable.
+func (f *Firewall) checkReserveScopesLocked(keys []scopeKey, estUSD float64, estTokens int, now time.Time) ([]string, error) {
 	for _, sk := range keys {
 		if verr := f.checkVelocityLocked(sk, estUSD, estTokens, now); verr != nil {
-			return nil, false, verr
+			return nil, verr
 		}
 	}
 	if f.limits.MaxConcurrent > 0 {
 		for _, sk := range keys {
 			if st := f.scopes[sk.mapKey]; st != nil && st.inflight >= f.limits.MaxConcurrent {
-				return nil, false, &ConcurrencyError{Scope: sk.name}
+				return nil, &ConcurrencyError{Scope: sk.name}
 			}
 		}
 	}
-	tk = &Ticket{fw: f, scopeKeys: make([]string, 0, len(keys)), estUSD: estUSD, estTokens: estTokens}
+	mapKeys := make([]string, 0, len(keys))
 	for _, sk := range keys {
 		st := f.ensureScopeLocked(sk.mapKey, now)
 		st.window.add(now.Unix(), estUSD, estTokens) // reserve the estimate
 		st.inflight++
-		tk.scopeKeys = append(tk.scopeKeys, sk.mapKey)
-		if sk.name == "run" && f.limits.MaxUSDPerRun > 0 {
-			st.runUSD += estUSD // reserve against the cumulative per-run budget
-			tk.runScopeKey = sk.mapKey
+		mapKeys = append(mapKeys, sk.mapKey)
+	}
+	return mapKeys, nil
+}
+
+// unreserveBudgetLocked rolls back a per-run budget reservation. Assumes f.mu held.
+func (f *Firewall) unreserveBudgetLocked(budgetKey string, estUSD float64) {
+	if budgetKey == "" {
+		return
+	}
+	if st := f.scopes[budgetKey]; st != nil {
+		st.runUSD -= estUSD
+		if st.runUSD < 0 {
+			st.runUSD = 0
 		}
 	}
-	return tk, false, nil
+}
+
+// enterShared is the admit path when a shared ScopeStore is configured: the local
+// loop + per-run-budget checks run under f.mu, then velocity + concurrency
+// check-and-reserve go to the shared store (one atomic op across replicas). On a
+// store denial the local budget reservation is rolled back so no partial state
+// leaks.
+func (f *Firewall) enterShared(key, runID, runKey, promptHash string, estUSD float64, estTokens int) (*Ticket, error) {
+	tripped, budgetKey := f.reserveLocalLocked(runKey, promptHash, estUSD)
+	if tripped {
+		_ = f.doKill(runKey)
+		return nil, ErrKilled
+	}
+
+	keys, names := f.storeScopes(key, runID)
+	if len(keys) == 0 {
+		// No velocity/concurrency caps configured: only the (local) budget applies.
+		return &Ticket{fw: f, runScopeKey: budgetKey, estUSD: estUSD, estTokens: estTokens}, nil
+	}
+	maxUSD := make([]float64, len(keys))
+	maxTok := make([]int, len(keys))
+	maxConc := make([]int, len(keys))
+	for i := range keys {
+		maxUSD[i] = f.limits.MaxUSDPerMin
+		maxTok[i] = f.limits.MaxTokensPerMin
+		maxConc[i] = f.limits.MaxConcurrent
+	}
+	holdID := newHoldID()
+	admitted, dname, dkind, err := f.scopeStore.Reserve(keys, names, maxUSD, maxTok, maxConc, estUSD, estTokens, holdID)
+	if err != nil {
+		// Redis unreachable: DON'T admit blind (that would drop the caps fleet-wide,
+		// worse than the no-Redis baseline). Fall back to LOCAL per-instance
+		// enforcement for this request — still bounded (N×), and the resulting ticket
+		// reconciles against LOCAL state (not the store), so it can't corrupt the
+		// shared window. Observable via Stats.ScopeDegraded.
+		f.scopeDegraded.Add(1)
+		return f.reserveScopesLocal(key, runID, budgetKey, estUSD, estTokens)
+	}
+	if !admitted {
+		f.releaseBudgetLocked(budgetKey, estUSD) // roll back the local budget reserve
+		if dkind == "concurrency" {
+			return nil, &ConcurrencyError{Scope: dname}
+		}
+		return nil, &VelocityError{Scope: dname, RetryAfterSec: windowSeconds}
+	}
+	return &Ticket{
+		fw: f, store: f.scopeStore, storeKeys: keys, holdID: holdID,
+		runScopeKey: budgetKey, estUSD: estUSD, estTokens: estTokens,
+	}, nil
+}
+
+// reserveLocalLocked runs the LOCAL parts of admit (loop detection + per-run
+// budget) under f.mu. It returns tripped=true when either fires (the caller then
+// kills), and the run-scope key if a budget reservation was held (for rollback /
+// settle).
+func (f *Firewall) reserveLocalLocked(runKey, promptHash string, estUSD float64) (tripped bool, budgetKey string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := f.now()
+	f.gcLocked(now)
+	return f.checkLoopBudgetLocked(runKey, promptHash, estUSD, now)
+}
+
+// reserveScopesLocal is the shared-mode fallback when Redis is unreachable: it
+// runs the LOCAL velocity/concurrency check-and-reserve (loop + budget already
+// done by reserveLocalLocked) and returns a LOCAL-backed ticket. On a local cap
+// breach it rolls back the budget reservation.
+func (f *Firewall) reserveScopesLocal(key, runID, budgetKey string, estUSD float64, estTokens int) (*Ticket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	now := f.now()
+	mapKeys, err := f.checkReserveScopesLocked(f.scopeKeys(key, runID), estUSD, estTokens, now)
+	if err != nil {
+		f.unreserveBudgetLocked(budgetKey, estUSD)
+		return nil, err
+	}
+	return &Ticket{fw: f, scopeKeys: mapKeys, runScopeKey: budgetKey, estUSD: estUSD, estTokens: estTokens}, nil
+}
+
+// releaseBudgetLocked unwinds a per-run budget reservation (used when the shared
+// store denies after the local budget was reserved).
+func (f *Firewall) releaseBudgetLocked(budgetKey string, estUSD float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unreserveBudgetLocked(budgetKey, estUSD)
+}
+
+// storeScopes lists the (key, run) scopes to enforce in the shared store, with
+// their display names. Empty when no velocity/concurrency cap is configured.
+func (f *Firewall) storeScopes(key, runID string) (keys, names []string) {
+	if f.limits.MaxUSDPerMin <= 0 && f.limits.MaxTokensPerMin <= 0 && f.limits.MaxConcurrent <= 0 {
+		return nil, nil
+	}
+	if key != "" {
+		keys = append(keys, "key:"+key)
+		names = append(names, "key")
+	}
+	if runID != "" {
+		keys = append(keys, f.runKey(key, runID))
+		names = append(names, "run")
+	}
+	return keys, names
 }
 
 // Settle reconciles the held estimate to the actual spend (delta into the same
@@ -421,11 +614,11 @@ func (tk *Ticket) Settle(actualUSD float64, actualTokens int) {
 		return
 	}
 	tk.fw.mu.Lock()
-	defer tk.fw.mu.Unlock()
 	// Settle must run before Release (the handler does; defer Release fires after).
 	// Guard against a released-then-settled ordering, which would double-unwind the
 	// reservation and drive runUSD negative.
 	if tk.settled || tk.released {
+		tk.fw.mu.Unlock()
 		return
 	}
 	tk.settled = true
@@ -444,6 +637,15 @@ func (tk *Ticket) Settle(actualUSD float64, actualTokens int) {
 			}
 		}
 	}
+	tk.fw.mu.Unlock()
+	// Shared velocity reconcile is done AFTER unlocking (network I/O must not hold
+	// f.mu); the settled flag above makes it idempotent. A failed reconcile is
+	// counted so a silent shared-window drift is observable.
+	if tk.store != nil {
+		if err := tk.store.Settle(tk.storeKeys, actualUSD-tk.estUSD, actualTokens-tk.estTokens); err != nil {
+			tk.fw.scopeDegraded.Add(1)
+		}
+	}
 }
 
 // Release frees the concurrency slots and, if the request never settled (it
@@ -453,11 +655,12 @@ func (tk *Ticket) Release() {
 		return
 	}
 	tk.fw.mu.Lock()
-	defer tk.fw.mu.Unlock()
 	if tk.released {
+		tk.fw.mu.Unlock()
 		return
 	}
 	tk.released = true
+	settled := tk.settled
 	now := tk.fw.now().Unix()
 	for _, mk := range tk.scopeKeys {
 		st := tk.fw.scopes[mk]
@@ -467,18 +670,27 @@ func (tk *Ticket) Release() {
 		if st.inflight > 0 {
 			st.inflight--
 		}
-		if !tk.settled {
+		if !settled {
 			st.window.add(now, -tk.estUSD, -tk.estTokens) // release the hold
 		}
 	}
 	// A failed (unsettled) request releases its cumulative per-run reservation too,
 	// so a run isn't charged for spend that never happened.
-	if !tk.settled && tk.runScopeKey != "" {
+	if !settled && tk.runScopeKey != "" {
 		if st := tk.fw.scopes[tk.runScopeKey]; st != nil {
 			st.runUSD -= tk.estUSD
 			if st.runUSD < 0 {
 				st.runUSD = 0
 			}
+		}
+	}
+	tk.fw.mu.Unlock()
+	// Shared mode: free the concurrency hold (and, if unsettled, the velocity
+	// reservation) after unlocking — network I/O must not hold f.mu. A failed
+	// release (a possibly-leaked hold, reaped later by TTL) is counted.
+	if tk.store != nil {
+		if err := tk.store.Release(tk.storeKeys, tk.holdID, tk.estUSD, tk.estTokens, settled); err != nil {
+			tk.fw.scopeDegraded.Add(1)
 		}
 	}
 }

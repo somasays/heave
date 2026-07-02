@@ -108,6 +108,12 @@ firewall:
   max_tokens_per_min: 0     # rolling tokens/min cap
   max_concurrent: 0         # max in-flight requests per key/run
   loop_threshold: 8         # auto-kill a run after N identical prompt-prefixes (runaway)
+  # Share run-kill state across replicas (a kill on one gateway stops the run on
+  # all). A kill is written to BOTH a local map and Redis, so a locally-issued
+  # kill still holds if Redis blips. Velocity/concurrency stay per-instance for
+  # now. Empty = single node (local map only).
+  # redis_url: "redis://localhost:6379/0"
+  # kill_ttl: 24h            # how long a kill is remembered (local + Redis TTL)
 
 # Pre-flight PII/secret redaction (regex-based, best-effort). Off by default —
 # it is lossy and can change model behavior. Built-ins: email, SSN, credit card,

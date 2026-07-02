@@ -15,16 +15,21 @@
 // its own runs (a spoofed X-Heave-Run-Id cannot kill or poison another caller's
 // run). Pure (stdlib only), injectable clock.
 //
-// State is in-memory and PER-INSTANCE: with N replicas the effective ceiling is
-// N× each cap and a kill on one replica does not stop the run on the others.
-// The guarantees hold within one instance; a shared store (Phase 2R) makes them
-// hold across replicas. Maps are size-capped and idle-swept so the enforcement
-// point cannot be OOM'd by rotating run ids.
+// Kill state is LAYERED: an always-on local store plus an optional shared store
+// (Redis, via WithKillStore). A kill on one replica propagates to all, and a
+// locally-issued kill still takes effect if the shared store is unreachable.
+// Velocity and concurrency state, by contrast, remain in-memory and PER-INSTANCE:
+// with N replicas the effective ceiling is N× each cap. Maps are idle-swept and
+// size-capped so the enforcement point cannot be OOM'd by rotating run ids; at
+// the kill-map cap a new kill is REFUSED (surfaced as an error) rather than
+// evicting a live kill, since dropping one would silently resurrect a runaway.
 package firewall
 
 import (
 	"errors"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,11 +39,26 @@ const (
 	defaultMaxScopes = 50_000
 	gcInterval       = 30 * time.Second
 	idleEvictTTL     = 2 * windowSeconds * time.Second
-	killedTTL        = time.Hour
+	// DefaultKillTTL bounds how long a kill is remembered; the timestamp is
+	// refreshed each time the run is checked, so an ACTIVE killed run stays dead
+	// while an abandoned/rotated run id is eventually forgotten. Overridable via
+	// Limits.KillTTL.
+	DefaultKillTTL = 24 * time.Hour
+	// maxKills caps the local kill map so a caller spraying run ids at the kill
+	// endpoint cannot OOM the enforcement point. When the cap is reached (after
+	// sweeping expired entries) a NEW kill is REFUSED with an error rather than
+	// evicting a still-live kill — dropping a live kill would silently resurrect
+	// a runaway, so we fail loud instead (the endpoint surfaces it as 5xx).
+	maxKills = 100_000
 )
 
 // ErrKilled means the run has been killed (manually or by loop detection).
 var ErrKilled = errors.New("run killed")
+
+// ErrKillStoreFull means the local kill map is at capacity with live kills, so a
+// new kill could not be recorded without evicting a live one. It surfaces so the
+// caller reports failure (and can retry) rather than silently under-enforcing.
+var ErrKillStoreFull = errors.New("kill store full")
 
 // VelocityError means a rolling-window rate cap ($/min or tokens/min) would be
 // exceeded. RetryAfterSec hints when the window will have drained.
@@ -62,6 +82,8 @@ type Limits struct {
 	// LoopThreshold auto-kills a run after the same prompt hash recurs this many
 	// times within a recent-history window. 0 disables it.
 	LoopThreshold int
+	// KillTTL bounds how long a kill is remembered (local + shared). 0 = default.
+	KillTTL time.Duration
 }
 
 // Firewall enforces Limits across keys and runs.
@@ -70,11 +92,43 @@ type Firewall struct {
 	limits  Limits
 	now     func() time.Time
 
+	// Kill state is LAYERED: a local in-memory store is always consulted (so a
+	// kill issued on this replica takes effect immediately and survives a Redis
+	// outage), plus an optional shared store (Redis) that propagates kills across
+	// replicas. A run is killed if EITHER says so.
+	localKills  *memKillStore
+	sharedKills KillStore
+	// sharedKillErrs counts shared-store (Redis) write failures across BOTH the
+	// manual and loop-trip kill paths, so a silent propagation failure on the
+	// auto path is still observable via /metrics.
+	sharedKillErrs atomic.Uint64
+
 	mu     sync.Mutex
 	scopes map[string]*scopeState
-	killed map[string]time.Time // composite run key -> killed-at
 	loops  map[string]*loopState
 	lastGC time.Time
+}
+
+// Stats is a point-in-time snapshot of firewall kill-state health, surfaced on
+// /metrics so operators can see the DoS backstop and propagation failures.
+type Stats struct {
+	// LocalKills is the number of live entries in the local kill map.
+	LocalKills int
+	// KillRejections counts kills refused because the local map was full of live
+	// kills (a nonzero value means the enforcement point is under kill pressure).
+	KillRejections uint64
+	// SharedKillErrors counts shared-store write failures (kills that may not have
+	// propagated to other replicas).
+	SharedKillErrors uint64
+}
+
+// KillStore is a shared run-kill store (e.g. Redis). Kill returns an error so a
+// failed write can be surfaced (a kill switch must not silently no-op). Killed
+// reports whether a run is killed; implementations should fail open (return
+// false on error) so a store outage doesn't block all traffic.
+type KillStore interface {
+	Kill(runKey string) error
+	Killed(runKey string) bool
 }
 
 type scopeState struct {
@@ -89,19 +143,148 @@ type loopState struct {
 }
 
 // New builds a Firewall. When enabled is false, Enter returns an inert Ticket
-// that admits everything. now may be nil (time.Now); injectable for tests.
+// that admits everything. now may be nil (time.Now); injectable for tests. Kill
+// state defaults to in-memory; use WithKillStore to share it across replicas.
 func New(enabled bool, limits Limits, now func() time.Time) *Firewall {
 	if now == nil {
 		now = time.Now
 	}
-	return &Firewall{
-		enabled: enabled,
-		limits:  limits,
-		now:     now,
-		scopes:  map[string]*scopeState{},
-		killed:  map[string]time.Time{},
-		loops:   map[string]*loopState{},
+	ttl := limits.KillTTL
+	if ttl <= 0 {
+		ttl = DefaultKillTTL
 	}
+	return &Firewall{
+		enabled:    enabled,
+		limits:     limits,
+		now:        now,
+		localKills: newMemKillStore(now, ttl),
+		scopes:     map[string]*scopeState{},
+		loops:      map[string]*loopState{},
+	}
+}
+
+// WithKillStore adds a shared kill store (e.g. Redis) alongside the always-on
+// local store and returns f. Kills then propagate across replicas, while a
+// locally-issued kill still takes effect if the shared store is unreachable.
+// Only the composition root (cmd) should call this, once, before serving.
+func (f *Firewall) WithKillStore(ks KillStore) *Firewall {
+	if ks != nil {
+		f.sharedKills = ks
+	}
+	return f
+}
+
+// isKilled reports whether a run is killed per EITHER the local or shared store.
+// Callers must not hold f.mu: the shared store may do network I/O.
+func (f *Firewall) isKilled(runKey string) bool {
+	if runKey == "" {
+		return false
+	}
+	if f.localKills.Killed(runKey) {
+		return true
+	}
+	return f.sharedKills != nil && f.sharedKills.Killed(runKey)
+}
+
+// doKill records a kill in the local store and the shared store (if configured).
+// A local failure (map full of live kills) is returned immediately — the kill did
+// NOT record here, so the caller must not report success. A shared failure is
+// counted (observability for the swallowed auto-kill path) and returned: the kill
+// is in effect on THIS replica but may not have propagated.
+func (f *Firewall) doKill(runKey string) error {
+	if err := f.localKills.Kill(runKey); err != nil {
+		return err
+	}
+	if f.sharedKills != nil {
+		if err := f.sharedKills.Kill(runKey); err != nil {
+			f.sharedKillErrs.Add(1)
+			return err
+		}
+	}
+	return nil
+}
+
+// Stats snapshots kill-state health for /metrics.
+func (f *Firewall) Stats() Stats {
+	local, rejects := f.localKills.stats()
+	return Stats{
+		LocalKills:       local,
+		KillRejections:   rejects,
+		SharedKillErrors: f.sharedKillErrs.Load(),
+	}
+}
+
+// memKillStore is the default in-memory KillStore: a map with self-expiring kills.
+// It is bounded by cap: at the cap it REFUSES new kills (never drops a live one).
+type memKillStore struct {
+	mu       sync.Mutex
+	m        map[string]time.Time
+	now      func() time.Time
+	ttl      time.Duration
+	cap      int
+	rejected uint64 // kills refused because the map was full of live kills
+}
+
+func newMemKillStore(now func() time.Time, ttl time.Duration) *memKillStore {
+	return &memKillStore{m: map[string]time.Time{}, now: now, ttl: ttl, cap: maxKills}
+}
+
+func (s *memKillStore) Kill(runKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	// Re-killing an already-tracked run is always allowed (refreshes, no growth).
+	// A NEW run at the cap: sweep expired first; if the map is still full it is
+	// full of LIVE kills, so refuse rather than resurrect a runaway by eviction.
+	if _, exists := s.m[runKey]; !exists && len(s.m) >= s.cap {
+		s.gcLocked(now)
+		if len(s.m) >= s.cap {
+			s.rejected++
+			return ErrKillStoreFull
+		}
+	}
+	s.m[runKey] = now
+	return nil
+}
+
+func (s *memKillStore) Killed(runKey string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.m[runKey]
+	if !ok {
+		return false
+	}
+	now := s.now()
+	if now.Sub(t) > s.ttl {
+		delete(s.m, runKey)
+		return false
+	}
+	// Refresh on hit so an ACTIVE killed run (still being checked on Enter) never
+	// ages out and resurrects; an abandoned kill stops being checked and expires.
+	s.m[runKey] = now
+	return true
+}
+
+// gc actively sweeps expired kills. It is called periodically (from the
+// firewall GC) so abandoned run ids are reclaimed even if never read again.
+func (s *memKillStore) gc(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcLocked(now)
+}
+
+func (s *memKillStore) gcLocked(now time.Time) {
+	for k, t := range s.m {
+		if now.Sub(t) > s.ttl {
+			delete(s.m, k)
+		}
+	}
+}
+
+func (s *memKillStore) stats() (size int, rejected uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.m), s.rejected
 }
 
 // Enabled reports whether the firewall enforces anything.
@@ -128,35 +311,49 @@ func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estToken
 	if !f.enabled {
 		return &Ticket{}, nil
 	}
+	runKey := f.runKey(key, runID)
+
+	// Kill check is OUTSIDE f.mu: the store may do network I/O (Redis), which
+	// must never be held under the global firewall lock.
+	if f.isKilled(runKey) {
+		return nil, ErrKilled
+	}
+
+	ticket, tripped, err := f.enterLocked(key, runID, runKey, promptHash, estUSD, estTokens)
+	if tripped {
+		// Loop detection tripped: kill the run (local + shared) outside the lock,
+		// since the shared store may do network I/O.
+		_ = f.doKill(runKey)
+		return nil, ErrKilled
+	}
+	return ticket, err
+}
+
+// enterLocked runs the check-and-reserve under f.mu. It returns tripped=true
+// (with a nil ticket) when loop detection fires, so the caller can issue the
+// kill after unlocking. The defer keeps the lock panic-safe.
+func (f *Firewall) enterLocked(key, runID, runKey, promptHash string, estUSD float64, estTokens int) (tk *Ticket, tripped bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
 	now := f.now()
 	f.gcLocked(now)
 
-	runKey := f.runKey(key, runID)
-
-	if runKey != "" {
-		if _, ok := f.killed[runKey]; ok {
-			return nil, ErrKilled
-		}
-		if f.limits.LoopThreshold > 0 && promptHash != "" && f.tripLoopLocked(runKey, promptHash, now) {
-			f.killed[runKey] = now
-			return nil, ErrKilled
-		}
+	if runKey != "" && f.limits.LoopThreshold > 0 && promptHash != "" &&
+		f.tripLoopLocked(runKey, promptHash, now) {
+		return nil, true, nil
 	}
 
 	keys := f.scopeKeys(key, runID)
 	// Check every scope first (all-or-nothing), then reserve.
 	for _, sk := range keys {
 		if verr := f.checkVelocityLocked(sk, estUSD, estTokens, now); verr != nil {
-			return nil, verr
+			return nil, false, verr
 		}
 	}
 	if f.limits.MaxConcurrent > 0 {
 		for _, sk := range keys {
 			if st := f.scopes[sk.mapKey]; st != nil && st.inflight >= f.limits.MaxConcurrent {
-				return nil, &ConcurrencyError{Scope: sk.name}
+				return nil, false, &ConcurrencyError{Scope: sk.name}
 			}
 		}
 	}
@@ -167,7 +364,7 @@ func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estToken
 		st.inflight++
 		mapKeys = append(mapKeys, sk.mapKey)
 	}
-	return &Ticket{fw: f, scopeKeys: mapKeys, estUSD: estUSD, estTokens: estTokens}, nil
+	return &Ticket{fw: f, scopeKeys: mapKeys, estUSD: estUSD, estTokens: estTokens}, false, nil
 }
 
 // Settle reconciles the held estimate to the actual spend (delta into the same
@@ -218,21 +415,23 @@ func (tk *Ticket) Release() {
 }
 
 // Kill hard-stops a run owned by ownerKey. A client can only kill its own runs.
-func (f *Firewall) Kill(ownerKey, runID string) {
+// The returned error is the shared store's write error (nil when there is no
+// shared store): a non-nil error means the kill is in effect on this replica but
+// may not have propagated to others, so the caller MUST surface it rather than
+// report success.
+func (f *Firewall) Kill(ownerKey, runID string) error {
 	if runID == "" {
-		return
+		return nil
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.killed[f.runKey(ownerKey, runID)] = f.now()
+	return f.doKill(f.runKey(ownerKey, runID))
 }
 
 // Killed reports whether a run (owned by ownerKey) has been killed.
 func (f *Firewall) Killed(ownerKey, runID string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.killed[f.runKey(ownerKey, runID)]
-	return ok
+	if runID == "" {
+		return false
+	}
+	return f.isKilled(f.runKey(ownerKey, runID))
 }
 
 type scopeKey struct {
@@ -252,11 +451,14 @@ func (f *Firewall) scopeKeys(key, runID string) []scopeKey {
 }
 
 // runKey namespaces a run by its owner so cross-tenant interference is impossible.
+// The owner is length-prefixed so the owner/run boundary is unambiguous even if
+// the owner (an operator-set client name) contains the separator byte — a raw
+// delimiter alone could be spoofed into a cross-owner collision.
 func (f *Firewall) runKey(ownerKey, runID string) string {
 	if runID == "" {
 		return ""
 	}
-	return "run:" + ownerKey + "\x00" + runID
+	return "run:" + strconv.Itoa(len(ownerKey)) + ":" + ownerKey + "\x00" + runID
 }
 
 func (f *Firewall) ensureScopeLocked(mapKey string, now time.Time) *scopeState {
@@ -332,11 +534,9 @@ func (f *Firewall) gcLocked(now time.Time) {
 			delete(f.loops, k)
 		}
 	}
-	for k, t := range f.killed {
-		if now.Sub(t) > killedTTL {
-			delete(f.killed, k)
-		}
-	}
+	// Actively sweep expired local kills so abandoned run ids are reclaimed even
+	// if never read again. Shared (Redis) kills self-expire via TTL.
+	f.localKills.gc(now)
 }
 
 // window is a rolling per-second ring covering windowSeconds of spend.

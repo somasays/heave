@@ -102,12 +102,21 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   streaming can't be a free firewall bypass. Reviews: ✅ Go
   (`docs/reviews/phase2r-streaming-go.md`) · ✅ SSE-compat
   (`docs/reviews/phase2r-streaming-compat.md`).
-- ⬜ **Shared state store (Redis)** — move budgets/rate/health/velocity off
-  per-instance memory; without it every guarantee is fiction at >1 replica
-  (N× problem). Degrade safely (fail-open vs fail-closed is a policy choice).
-  Design behind a Store interface: in-memory default (hermetic tests), Redis
-  behind an opt-in integration tier (like the `live` build tag).
-  - ⬜ Deferred: 1 MiB SSE line cap; byte-based settlement for aborted streams.
+- 🟡 **Shared state store (Redis)** — first primitive shipped: **shared run-kill
+  store**. `internal/redisstore` implements `firewall.KillStore` structurally
+  (firewall stays pure); kill state is layered (always-on local map + optional
+  Redis), so a kill on one replica propagates to all AND a locally-issued kill
+  survives a Redis blip. Reads fail open (availability); a kill that can't durably
+  record surfaces as 5xx (never a false success); at the map cap a new kill is
+  refused, never satisfied by evicting a live kill; run ids charset-validated on
+  both reserve+kill paths; `/metrics` exposes kill-pressure + propagation-failure
+  counts. Hermetic tests via miniredis (cross-instance, TTL, fail-open, cap).
+  Reviews: ✅ security (`docs/reviews/phase2r-redis-security.md`, FAIL→fixed) ·
+  ✅ Go (`docs/reviews/phase2r-redis-go.md`, PASS-with-nits→fixed).
+  - ⬜ Still per-instance (needs an atomic Redis reserve/settle):
+    budgets/rate/health/**velocity/concurrency**. Kill is the only shared piece.
+  - ⬜ Deferred: cancel in-flight (streaming) requests on kill; durable/permanent
+    kill beyond TTL; 1 MiB SSE line cap; byte-based settlement for aborted streams.
 
 ## Phase 3F — Firewall primitives (the headline) — MVP DONE
 - ✅ **Run identity** — `X-Heave-Run-Id`, scope namespaced by the authenticated
@@ -122,8 +131,8 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   ✅ Go (`docs/reviews/phase3f-firewall-go.md`). In-memory/per-instance MVP.
 
 ### Deferred from firewall reviews (tracked)
-- ⬜ Cross-replica shared store (Phase 2R) — removes the per-instance N× / kill-
-  not-global limitation; makes the guarantee hold at scale.
+- 🟡 Cross-replica shared store (Phase 2R) — **kill is now shared** (Redis);
+  velocity/concurrency still per-instance until an atomic Redis reserve/settle.
 - ⬜ Nonce-robust / structural-prefix loop detection (beyond exact-hash).
 - ⬜ Require auth for firewall enforcement to be meaningful (auth-off = dev only).
 - ⬜ Tokenizer-based cost/token estimate (replace the chars/4 heuristic).

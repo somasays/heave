@@ -123,12 +123,25 @@ func (s *Server) handleKillRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "run_id is required")
 		return
 	}
-	// A caller can only kill its own runs (scoped by the authenticated key).
-	ownerKey := ""
-	if client != nil {
-		ownerKey = client.Name
+	// Validate identically to the reserve path so every reservable run id is
+	// addressable here (no reservable-but-unkillable runs).
+	if !validRunID(runID) {
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"run_id must be 1-128 chars of [A-Za-z0-9._-]")
+		return
 	}
-	s.firewall.Kill(ownerKey, runID)
+	// A caller can only kill its own runs (scoped by the authenticated key). This
+	// MUST match the owner the request path uses (clientName), or a kill would
+	// target a different run scope than the traffic it means to stop.
+	ownerKey := clientName(client)
+	if err := s.firewall.Kill(ownerKey, runID); err != nil {
+		// The kill did not durably record (local map full, or shared-store write
+		// failed). Report failure rather than a false 200 — a kill switch that
+		// lies is worse than one that asks for a retry.
+		s.log.Error("run kill failed to record", "run_id", runID, "owner", ownerKey, "err", err)
+		writeError(w, http.StatusServiceUnavailable, "api_error", "kill not durably recorded; retry")
+		return
+	}
 	s.log.Warn("run killed", "run_id", runID, "owner", ownerKey)
 	writeJSON(w, http.StatusOK, map[string]any{"killed": runID})
 }
@@ -140,10 +153,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	reqs, toks, cost := s.ledger.Totals()
+	fw := s.firewall.Stats()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"requests": reqs,
 		"tokens":   toks,
 		"cost_usd": cost,
+		// Kill-state health: nonzero rejections/errors mean the enforcement point
+		// is under kill pressure or failing to propagate kills to other replicas.
+		"firewall_live_kills":         fw.LocalKills,
+		"firewall_kill_rejections":    fw.KillRejections,
+		"firewall_shared_kill_errors": fw.SharedKillErrors,
 	})
 }
 
@@ -211,10 +230,22 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Firewall (Invariant #9): pre-vendor velocity / concurrency / kill / loop
-	// enforcement, scoped to the client key and the agent run. The estimate is
-	// reserved (held in the window) and reconciled by Settle on success.
-	fwKey := userName(client, &req)
+	// enforcement, scoped to the client key and the agent run. The scope owner is
+	// the AUTHENTICATED client (never the spoofable `user` field), so the run key
+	// here matches the one the kill endpoint targets. The estimate is reserved
+	// (held in the window) and reconciled by Settle on success.
+	fwKey := clientName(client)
 	runID := strings.TrimSpace(r.Header.Get("X-Heave-Run-Id"))
+	// A run id must be a single safe token so the run a request RESERVES is one
+	// the kill endpoint (a single {run_id} path segment) can address. Rejecting
+	// here — rather than silently accepting an unkillable run — keeps the kill
+	// switch's guarantee honest.
+	if runID != "" && !validRunID(runID) {
+		s.guard.Settle(reservation, 0)
+		writeError(w, http.StatusBadRequest, "invalid_request_error",
+			"X-Heave-Run-Id must be 1-128 chars of [A-Za-z0-9._-]")
+		return
+	}
 	ticket, ferr := s.firewall.Enter(fwKey, runID, promptHash(&req), estUSD, estTokens)
 	if ferr != nil {
 		s.guard.Settle(reservation, 0)
@@ -524,12 +555,44 @@ func bearerToken(r *http.Request) string {
 }
 
 // userName attributes spend to the authenticated client, falling back to the
-// request's own `user` field when auth is disabled.
+// request's own `user` field when auth is disabled. Used for LEDGER attribution
+// only — never for firewall scoping (the `user` field is client-controlled).
 func userName(client *controls.Client, req *openai.ChatCompletionRequest) string {
 	if client != nil {
 		return client.Name
 	}
 	return req.User
+}
+
+// clientName is the firewall/kill scope owner: the authenticated client name, or
+// "" when auth is disabled. Unlike userName it never trusts the request's `user`
+// field, so the run scope a request reserves matches the one the kill endpoint
+// targets (otherwise a spoofed `user` would make a run unkillable).
+func clientName(client *controls.Client) string {
+	if client != nil {
+		return client.Name
+	}
+	return ""
+}
+
+// validRunID constrains a run id to a single safe token, enforced identically on
+// the reserve (X-Heave-Run-Id) and kill ({run_id}) paths. Bounding the charset to
+// a single URL path segment guarantees any reservable run is addressable by the
+// kill endpoint, and excludes NUL / control / separator bytes that could forge a
+// cross-owner key collision.
+func validRunID(runID string) bool {
+	if len(runID) == 0 || len(runID) > 128 {
+		return false
+	}
+	for _, c := range runID {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '.' || c == '_' || c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // denied maps a controls rejection to the right HTTP status and logs it, so

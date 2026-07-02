@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/provider"
 	"github.com/somasays/heave/internal/redact"
+	"github.com/somasays/heave/internal/redisstore"
 	"github.com/somasays/heave/internal/router"
 	"github.com/somasays/heave/internal/server"
 )
@@ -79,16 +81,44 @@ func run(configPath string, log *slog.Logger) error {
 	if redactor.Enabled() {
 		log.Info("PII redaction is enabled (regex-based, best-effort)")
 	}
+	// Resolve the kill TTL once so the local map and the Redis key expiry agree
+	// (single source of truth). A zero TTL passed to Redis means "never expire".
+	killTTL := cfg.Firewall.KillTTL
+	if killTTL <= 0 {
+		killTTL = firewall.DefaultKillTTL
+	}
 	fw := firewall.New(cfg.Firewall.Enabled, firewall.Limits{
 		MaxUSDPerMin:    cfg.Firewall.MaxUSDPerMin,
 		MaxTokensPerMin: cfg.Firewall.MaxTokensPerMin,
 		MaxConcurrent:   cfg.Firewall.MaxConcurrent,
 		LoopThreshold:   cfg.Firewall.LoopThreshold,
+		KillTTL:         killTTL,
 	}, nil)
+	if cfg.Firewall.RedisURL != "" {
+		store, err := redisstore.New(cfg.Firewall.RedisURL, killTTL)
+		if err != nil {
+			return fmt.Errorf("firewall redis: %w", err)
+		}
+		defer func() { _ = store.Close() }()
+		pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err = store.Ping(pingCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("firewall redis unreachable: %w", err)
+		}
+		fw.WithKillStore(store)
+		log.Info("firewall kill state shared via redis")
+	}
 	if fw.Enabled() {
 		log.Info("spend/quota firewall enabled",
 			"usd_per_min", cfg.Firewall.MaxUSDPerMin, "max_concurrent", cfg.Firewall.MaxConcurrent,
-			"loop_threshold", cfg.Firewall.LoopThreshold)
+			"loop_threshold", cfg.Firewall.LoopThreshold, "shared_kill", cfg.Firewall.RedisURL != "")
+		if !cfg.Auth.Enabled {
+			// With auth off the firewall scope owner collapses to "" for everyone:
+			// run scoping is cross-caller, and the kill endpoint is unauthenticated.
+			// The firewall's per-run isolation is effectively OFF — dev use only.
+			log.Warn("firewall is enabled but auth is DISABLED: run scoping collapses across callers and the kill endpoint is unauthenticated; enable auth for real isolation")
+		}
 	}
 
 	srv := server.New(server.Deps{

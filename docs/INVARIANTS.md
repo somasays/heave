@@ -85,11 +85,26 @@ so a spoofed `X-Heave-Run-Id` cannot kill or poison another caller's run. *Why:*
 a runaway agent burns five figures in hours — a monthly budget is the wrong time
 constant, and "failover after 429" doesn't arbitrate a shared quota. This is the
 acute, underserved pain where heave's pre-vendor / reserve-settle / Go-data-plane
-DNA is a real advantage over re-implementing LiteLLM. *Caveats:* enforcement is
-**per-instance** — N replicas allow N× each cap and a kill on one replica doesn't
-stop the run on others until the shared store lands (Phase 2R); and it is only
-meaningful with **auth enabled** (with auth off the scope key derives from
-client-controlled input — dev only).
+DNA is a real advantage over re-implementing LiteLLM. *Caveats:* **kills are now
+shared** — with `firewall.redis_url` set, a kill on one replica stops the run on
+all (layered local+Redis store, so a locally-issued kill still holds if Redis
+blips; a kill that fails to durably record surfaces as a 5xx, never a false
+success). Cross-replica propagation is **best-effort and Redis-availability-
+gated**: reads fail OPEN, so during a Redis outage a *remotely*-issued kill is not
+seen on other replicas and that runaway keeps spending there until Redis recovers
+(the replica that issued the kill still enforces it locally). A kill stops
+*subsequent* requests on the run; it does not cancel an already-dispatched
+request (an in-flight stream runs to completion). Velocity and concurrency caps
+remain **per-instance** — N replicas allow N× each cap until their shared store
+lands (a follow-up needs an atomic Redis reserve/settle). The local kill map is
+size-capped: past the cap a new kill is *refused* (5xx), never satisfied by
+evicting a live kill; `/metrics` exposes rejection and propagation-failure counts.
+Enforcement scope is keyed to the **authenticated client** (empty when auth is
+off), never the client-controlled `user` field, so a run reserved by a request is
+the same run the kill endpoint can stop; run ids are charset-validated identically
+on the reserve and kill paths (no reservable-but-unkillable runs). It is only
+meaningful with **auth enabled** (with auth off all traffic shares the empty
+owner and the kill endpoint is unauthenticated — dev only).
 
 ---
 

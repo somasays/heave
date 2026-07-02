@@ -420,6 +420,64 @@ func TestKillEndpointBlocksRun(t *testing.T) {
 	}
 }
 
+// TestKillWorksWhenRequestSetsUserField is the F3 regression: firewall run scope
+// must key off the authenticated client (empty when auth is off), NOT the
+// client-controlled `user` field. Before the fix, a request carrying `"user"`
+// reserved its run under that value while the kill endpoint targeted "", so the
+// runaway was unkillable. Both must resolve to the same owner.
+func TestKillWorksWhenRequestSetsUserField(t *testing.T) {
+	h := firewallServer(t, firewall.Limits{})
+	body := `{"model":"m","user":"spoofed-tenant","messages":[{"role":"user","content":"hi"}]}`
+	send := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("X-Heave-Run-Id", "ru")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+	if rr := send(); rr.Code != 200 {
+		t.Fatalf("run should work before kill, got %d", rr.Code)
+	}
+	kreq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/runs/ru/kill", nil)
+	krr := httptest.NewRecorder()
+	h.ServeHTTP(krr, kreq)
+	if krr.Code != 200 {
+		t.Fatalf("kill endpoint: want 200, got %d", krr.Code)
+	}
+	if rr := send(); rr.Code != http.StatusForbidden {
+		t.Fatalf("killed run must be blocked even when request carries a user field, got %d", rr.Code)
+	}
+}
+
+// TestRunIDCharsetIsValidatedOnBothPaths is the MF-2 regression: a run id must be
+// a single safe token so every reservable run is addressable by the kill endpoint.
+// An id the kill route (one path segment) can't name must be rejected on ingress,
+// never silently accepted as an unkillable run.
+func TestRunIDCharsetIsValidatedOnBothPaths(t *testing.T) {
+	h := firewallServer(t, firewall.Limits{})
+	// Reserve path: a slash-bearing run id (not a single path segment) is rejected.
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Heave-Run-Id", "a/b/c")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("slash-bearing run id must be rejected on reserve, got %d", rr.Code)
+	}
+	// Kill path: same validation, so a malformed id gets a clear 400 (not a 200 for
+	// a run that was never reservable).
+	kreq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/runs/bad%20id/kill", nil)
+	krr := httptest.NewRecorder()
+	h.ServeHTTP(krr, kreq)
+	if krr.Code != http.StatusBadRequest {
+		t.Fatalf("malformed run id must be rejected on kill, got %d", krr.Code)
+	}
+	// A valid run id still works end to end.
+	if rr := chatWithRun(h, "run.1_ok-2"); rr.Code != 200 {
+		t.Fatalf("valid run id must be accepted, got %d", rr.Code)
+	}
+}
+
 func TestLoopAutoKillViaHandler(t *testing.T) {
 	h := firewallServer(t, firewall.Limits{LoopThreshold: 3})
 	codes := []int{}

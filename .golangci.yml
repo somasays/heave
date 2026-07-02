@@ -70,6 +70,11 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/firewall must stay pure (no other internal packages)"
+        redisstore-pure:
+          files: ["**/internal/redisstore/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/redisstore must not import other internal packages (it implements interfaces structurally)"
         cachebench-pure:
           files: ["**/internal/cachebench/**"]
           deny:

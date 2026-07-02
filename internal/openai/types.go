@@ -117,6 +117,33 @@ type Usage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ChatCompletionChunk is one SSE event in a streaming response
+// (`object: chat.completion.chunk`), matching OpenAI's streaming shape.
+type ChatCompletionChunk struct {
+	ID      string        `json:"id"`
+	Object  string        `json:"object"`
+	Created int64         `json:"created"`
+	Model   string        `json:"model"`
+	Choices []ChunkChoice `json:"choices"`
+	// Usage is populated only on the final chunk (stream_options.include_usage).
+	Usage *Usage `json:"usage,omitempty"`
+}
+
+// ChunkChoice is one streamed choice carrying an incremental delta. FinishReason
+// is a pointer so it serializes as JSON null on content chunks (what OpenAI
+// sends) and as the reason string only on the terminal chunk.
+type ChunkChoice struct {
+	Index        int     `json:"index"`
+	Delta        Delta   `json:"delta"`
+	FinishReason *string `json:"finish_reason"`
+}
+
+// Delta is the incremental content of a streamed chunk.
+type Delta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
 // ErrorResponse is the OpenAI-compatible error envelope.
 type ErrorResponse struct {
 	Error ErrorBody `json:"error"`

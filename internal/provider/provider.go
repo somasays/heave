@@ -63,7 +63,15 @@ type Provider interface {
 	// Name is the stable identifier used in config and logs (e.g. "anthropic").
 	Name() string
 	// ChatCompletion sends one completion request and returns the normalized
-	// result. Streaming is a later phase. Upstream HTTP failures are returned
-	// as *Error.
+	// result. Upstream HTTP failures are returned as *Error.
 	ChatCompletion(ctx context.Context, req *Request) (*Response, error)
+	// ChatCompletionStream streams the response, calling onDelta for each text
+	// chunk, and returns the final normalized Response (usage + finish reason)
+	// once the stream ends. If it errors BEFORE onDelta is ever called, the
+	// caller may safely fail over to another provider.
+	ChatCompletionStream(ctx context.Context, req *Request, onDelta StreamFunc) (*Response, error)
 }
+
+// StreamFunc receives each incremental text delta of a streaming response.
+// Returning an error (e.g. the client disconnected) aborts the upstream stream.
+type StreamFunc func(delta string) error

@@ -50,6 +50,9 @@ curl localhost:8080/v1/chat/completions \
 For trusted local-only use, set `auth.enabled: false` in `config.yaml` (a loud
 warning is logged, and the bearer header is then optional).
 
+Streaming works too — add `"stream": true` and you get an OpenAI-compatible SSE
+stream (`chat.completion.chunk` events + a `[DONE]` terminator).
+
 `GET /healthz` for liveness, `GET /metrics` for running request/token/cost
 totals.
 

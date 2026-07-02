@@ -46,11 +46,13 @@ func newTestServer(t *testing.T, d Deps, opts Options) *Server {
 }
 
 type fakeProvider struct {
-	resp   *provider.Response
-	err    error
-	block  bool
-	gotReq *provider.Request
-	calls  int
+	resp         *provider.Response
+	err          error
+	block        bool
+	gotReq       *provider.Request
+	calls        int
+	deltas       []string // if set, streamed instead of resp.Content
+	midStreamErr error    // if set, returned AFTER streaming deltas (mid-stream failure)
 }
 
 func (f *fakeProvider) Name() string { return "fake" }
@@ -64,6 +66,31 @@ func (f *fakeProvider) ChatCompletion(ctx context.Context, req *provider.Request
 	}
 	if f.err != nil {
 		return nil, f.err
+	}
+	return f.resp, nil
+}
+
+func (f *fakeProvider) ChatCompletionStream(ctx context.Context, req *provider.Request, onDelta provider.StreamFunc) (*provider.Response, error) {
+	f.calls++
+	f.gotReq = req
+	if f.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.err != nil {
+		return nil, f.err // error before any delta → failover-safe
+	}
+	chunks := f.deltas
+	if len(chunks) == 0 && f.resp != nil && f.resp.Content != "" {
+		chunks = []string{f.resp.Content}
+	}
+	for _, c := range chunks {
+		if err := onDelta(c); err != nil {
+			return nil, err
+		}
+	}
+	if f.midStreamErr != nil {
+		return nil, f.midStreamErr // failed after bytes were streamed
 	}
 	return f.resp, nil
 }
@@ -352,11 +379,14 @@ func TestServedProviderHeader(t *testing.T) {
 }
 
 func firewallServer(t *testing.T, limits firewall.Limits) http.Handler {
+	return firewallServerFP(t, limits, &fakeProvider{resp: &provider.Response{Content: "ok", InputTokens: 1000, OutputTokens: 1000}})
+}
+
+func firewallServerFP(t *testing.T, limits firewall.Limits, fp *fakeProvider) http.Handler {
 	t.Helper()
 	rtr := router.New([]router.ModelConfig{{
 		Alias: "m", Provider: "fake", Upstream: "u", Price: router.Price{InputPerMTok: 1, OutputPerMTok: 5},
 	}}, "m")
-	fp := &fakeProvider{resp: &provider.Response{Content: "ok", InputTokens: 1000, OutputTokens: 1000}}
 	srv := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"fake": fp}, Firewall: firewall.New(true, limits, nil)},
 		Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
 	return srv.Handler()
@@ -411,6 +441,106 @@ func TestVelocityReturns429(t *testing.T) {
 	rr := chatWithRun(h, "run")
 	if rr.Code != http.StatusTooManyRequests || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("velocity cap should 429 with Retry-After, got %d ra=%q", rr.Code, rr.Header().Get("Retry-After"))
+	}
+}
+
+func TestStreamingSuccess(t *testing.T) {
+	fp := &fakeProvider{
+		deltas: []string{"hello ", "world"},
+		resp:   &provider.Response{InputTokens: 5, OutputTokens: 2, FinishReason: "stop"},
+	}
+	rtr := router.New([]router.ModelConfig{{Alias: "m", Provider: "fake", Upstream: "up-x"}}, "m")
+	srv := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"fake": fp}},
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
+	rr := post(srv.Handler(), `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if rr.Code != 200 {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("want SSE content-type, got %q", ct)
+	}
+	if rr.Header().Get("X-Heave-Provider") != "fake" {
+		t.Fatalf("served-provider header missing on stream: %v", rr.Header())
+	}
+	body := rr.Body.String()
+	for _, want := range []string{
+		`"role":"assistant"`,     // leading role chunk
+		`"content":"hello "`,     // delta 1
+		`"content":"world"`,      // delta 2
+		`"finish_reason":"stop"`, // terminal chunk
+		`"completion_tokens":2`,  // usage trailer values
+		`"prompt_tokens":5`,
+		"data: [DONE]",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, body)
+		}
+	}
+	// Content chunks must carry finish_reason:null (present, not omitted).
+	if !strings.Contains(body, `"finish_reason":null`) {
+		t.Fatalf("content chunks should emit finish_reason:null, got:\n%s", body)
+	}
+}
+
+func streamRun(h http.Handler, runID string) *httptest.ResponseRecorder {
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Heave-Run-Id", runID)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestStreamingAbortChargesEstimate(t *testing.T) {
+	// A stream that fails after emitting bytes must NOT be free: the reserved
+	// estimate is charged (per-run scope), so a subsequent request on the same run
+	// hits the velocity cap. If the abort released the hold to 0, the 2nd passes.
+	fp := &fakeProvider{deltas: []string{"partial answer"}, midStreamErr: &provider.Error{StatusCode: 500, Message: "boom"}}
+	h := firewallServerFP(t, firewall.Limits{MaxUSDPerMin: 0.03}, fp)
+
+	rr := streamRun(h, "r")
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "partial answer") || !strings.Contains(rr.Body.String(), "data: [DONE]") {
+		t.Fatalf("aborted stream should still be 200 SSE with the partial + DONE: code=%d body=%q", rr.Code, rr.Body)
+	}
+	if rr2 := streamRun(h, "r"); rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("aborted stream must charge its estimate (want 2nd request 429), got %d", rr2.Code)
+	}
+}
+
+func TestStreamingUsageOmittedChargesEstimate(t *testing.T) {
+	// Upstream success but zero usage (usage-omitting backend) must fail closed to
+	// the estimate, not book zero — else it's a free bypass.
+	fp := &fakeProvider{deltas: []string{"hi"}, resp: &provider.Response{FinishReason: "stop"}} // no tokens
+	h := firewallServerFP(t, firewall.Limits{MaxUSDPerMin: 0.03}, fp)
+	if rr := streamRun(h, "r"); rr.Code != 200 {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	if rr2 := streamRun(h, "r"); rr2.Code != http.StatusTooManyRequests {
+		t.Fatalf("zero-usage success must charge the estimate (want 2nd 429), got %d", rr2.Code)
+	}
+}
+
+func TestStreamingFailsOverBeforeFirstByte(t *testing.T) {
+	primary := &fakeProvider{err: &provider.Error{StatusCode: 500, Message: "boom"}}
+	secondary := &fakeProvider{resp: &provider.Response{Content: "from-secondary", InputTokens: 1, OutputTokens: 1, FinishReason: "stop"}}
+	h := failoverServer(t, primary, secondary)
+	rr := post(h, `{"model":"p","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), "from-secondary") {
+		t.Fatalf("should have streamed from the secondary: code=%d body=%q", rr.Code, rr.Body)
+	}
+}
+
+func TestStreamingProviderErrorBeforeByteIsJSONError(t *testing.T) {
+	// A single-candidate stream that errors before any byte must return a normal
+	// JSON error (not a half-open SSE), since no status was written yet.
+	fp := &fakeProvider{err: &provider.Error{StatusCode: 400, Type: "invalid_request_error", Message: "bad"}}
+	rtr := router.New([]router.ModelConfig{{Alias: "m", Provider: "fake", Upstream: "u"}}, "m")
+	srv := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"fake": fp}},
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
+	rr := post(srv.Handler(), `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != 400 {
+		t.Fatalf("pre-byte error should be a 400 JSON error, got %d", rr.Code)
 	}
 }
 

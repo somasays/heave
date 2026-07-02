@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -127,6 +128,63 @@ func toAnthropicMessages(in []Message) ([]anthropic.MessageParam, error) {
 		}
 	}
 	return out, nil
+}
+
+// ChatCompletionStream streams the Anthropic response, invoking onDelta for each
+// text delta, and returns the final normalized Response (with usage) at the end.
+func (a *Anthropic) ChatCompletionStream(ctx context.Context, req *Request, onDelta StreamFunc) (*Response, error) {
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = defaultMaxTokens
+	}
+	msgs, err := toAnthropicMessages(req.Messages)
+	if err != nil {
+		return nil, &Error{StatusCode: 400, Type: "invalid_request_error", Message: err.Error()}
+	}
+	params := anthropic.MessageNewParams{
+		Model:     req.Model,
+		MaxTokens: int64(maxTokens),
+		Messages:  msgs,
+	}
+	if req.System != "" {
+		params.System = []anthropic.TextBlockParam{{Text: req.System}}
+	}
+	if req.Temperature != nil {
+		params.Temperature = anthropic.Float(*req.Temperature)
+	}
+	if req.TopP != nil {
+		params.TopP = anthropic.Float(*req.TopP)
+	}
+
+	stream := a.client.Messages.NewStreaming(ctx, params)
+	defer func() { _ = stream.Close() }()
+	var acc anthropic.Message
+	var text strings.Builder
+	for stream.Next() {
+		event := stream.Current()
+		if err := acc.Accumulate(event); err != nil {
+			return nil, &Error{StatusCode: 0, Type: "api_error", Message: "anthropic: accumulate: " + err.Error()}
+		}
+		if d, ok := event.AsAny().(anthropic.ContentBlockDeltaEvent); ok {
+			if td, ok := d.Delta.AsAny().(anthropic.TextDelta); ok && td.Text != "" {
+				text.WriteString(td.Text)
+				if err := onDelta(td.Text); err != nil {
+					return nil, err // client aborted
+				}
+			}
+		}
+	}
+	if err := stream.Err(); err != nil {
+		return nil, mapAnthropicError(err)
+	}
+	return &Response{
+		Content:               text.String(),
+		InputTokens:           int(acc.Usage.InputTokens),
+		OutputTokens:          int(acc.Usage.OutputTokens),
+		CacheReadInputTokens:  int(acc.Usage.CacheReadInputTokens),
+		CacheWriteInputTokens: int(acc.Usage.CacheCreationInputTokens),
+		FinishReason:          mapAnthropicStop(string(acc.StopReason)),
+	}, nil
 }
 
 // mapAnthropicError converts an SDK error into a normalized provider.Error,

@@ -226,45 +226,103 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancel()
 
-	// Failover: try candidates in order, skipping unhealthy providers, stopping
-	// on success or a terminal (non-retryable) error. Each failed attempt is
-	// recorded so vendor-side spend is never invisible.
-	var (
-		presp     *provider.Response
-		used      router.Decision
-		lastErr   error
-		served    bool
-		attempted bool
-	)
+	acct := accounting{
+		client: client, reservation: reservation, ticket: ticket,
+		requestID: requestID, start: start, primaryAlias: primary.Alias,
+		estUSD: estUSD, estTokens: estTokens,
+	}
+	if req.Stream {
+		s.serveStreaming(ctx, w, &req, candidates, acct)
+		return
+	}
+	s.serveUnary(ctx, w, &req, candidates, acct)
+}
+
+// accounting carries the per-request settle/record state shared by the unary and
+// streaming dispatch paths.
+type accounting struct {
+	client       *controls.Client
+	reservation  *controls.Reservation
+	ticket       *firewall.Ticket
+	requestID    string
+	start        time.Time
+	primaryAlias string
+	estUSD       float64
+	estTokens    int
+}
+
+// runCandidates tries candidates in order, skipping unhealthy providers and
+// recording each failed attempt. attempt performs one dispatch (unary or
+// streaming); canFailover reports whether it is still safe to try the next
+// candidate (false once a stream has written bytes). It stops on success or a
+// terminal/no-longer-failover-able error.
+func (s *Server) runCandidates(
+	ctx context.Context, req *openai.ChatCompletionRequest, candidates []router.Decision, acct accounting,
+	attempt func(prov provider.Provider, d router.Decision) (*provider.Response, error),
+	canFailover func() bool,
+) (presp *provider.Response, used router.Decision, served, attempted bool, lastErr error) {
 	for _, d := range candidates {
 		prov, ok := s.providers[d.Provider]
 		if !ok || !s.health.Healthy(d.Provider) {
 			continue
 		}
 		attempted = true
-		resp, err := prov.ChatCompletion(ctx, toProviderRequest(&req, d))
+		resp, err := attempt(prov, d)
 		if err == nil {
 			s.health.RecordSuccess(d.Provider)
-			presp, used, served = resp, d, true
-			break
+			return resp, d, true, true, nil
 		}
 		lastErr = err
 		s.ledger.Record(ledger.Record{
-			RequestID: requestID, Alias: d.Alias, Provider: d.Provider, Upstream: d.Upstream,
-			User: userName(client, &req), LatencyMS: time.Since(start).Milliseconds(), Status: "error",
+			RequestID: acct.requestID, Alias: d.Alias, Provider: d.Provider, Upstream: d.Upstream,
+			User: userName(acct.client, req), LatencyMS: time.Since(acct.start).Milliseconds(), Status: "error",
 		})
-		if ctx.Err() != nil || !retryable(err) {
-			break // client cancel / deadline, or terminal error — do not blame provider health
+		if ctx.Err() != nil || !retryable(err) || !canFailover() {
+			break
 		}
 		if !isRateLimited(err) {
-			// 429 is load, not unhealth; counting it would evacuate all traffic
-			// to fallbacks and cascade. Only real infra faults open the breaker.
 			s.health.RecordFailure(d.Provider)
 		}
 	}
+	return nil, router.Decision{}, false, attempted, lastErr
+}
+
+// recordSuccess settles the budget/firewall reservations and logs the billable
+// record. If the upstream returned no usage (some OpenAI-compatible backends omit
+// it on streams), it FAILS CLOSED to the reserved estimate rather than booking
+// zero — otherwise a usage-omitting backend would make requests free and evade
+// the velocity/budget caps.
+func (s *Server) recordSuccess(req *openai.ChatCompletionRequest, acct accounting, used router.Decision, presp *provider.Response) {
+	inTok, outTok := presp.InputTokens, presp.OutputTokens
+	cacheR, cacheW := presp.CacheReadInputTokens, presp.CacheWriteInputTokens
+	status := "ok"
+	cost := ledger.Cost(inTok, outTok, cacheR, cacheW, used.Price.InputPerMTok, used.Price.OutputPerMTok)
+	if inTok == 0 && outTok == 0 && cacheR == 0 && cacheW == 0 {
+		cost = acct.estUSD
+		inTok, outTok = acct.estTokens, 0
+		status = "ok_estimated"
+		s.log.Warn("upstream returned no usage; charging reserved estimate",
+			"request_id", acct.requestID, "provider", used.Provider)
+	}
+	s.guard.Settle(acct.reservation, cost)
+	acct.ticket.Settle(cost, inTok+outTok)
+	s.ledger.Record(ledger.Record{
+		RequestID: acct.requestID, Alias: used.Alias, Provider: used.Provider, Upstream: used.Upstream,
+		User: userName(acct.client, req), InputTokens: inTok, OutputTokens: outTok,
+		CacheReadTokens: cacheR, CacheWriteTokens: cacheW,
+		CostUSD: cost, LatencyMS: time.Since(acct.start).Milliseconds(), Status: status,
+	})
+}
+
+func (s *Server) serveUnary(ctx context.Context, w http.ResponseWriter, req *openai.ChatCompletionRequest, candidates []router.Decision, acct accounting) {
+	presp, used, served, attempted, lastErr := s.runCandidates(ctx, req, candidates, acct,
+		func(prov provider.Provider, d router.Decision) (*provider.Response, error) {
+			return prov.ChatCompletion(ctx, toProviderRequest(req, d))
+		},
+		func() bool { return true })
 
 	if !served {
-		s.guard.Settle(reservation, 0) // release the hold; no successful billable spend
+		s.guard.Settle(acct.reservation, 0)
 		if !attempted {
 			writeError(w, http.StatusServiceUnavailable, "api_error", "no healthy provider available for this model")
 			return
@@ -276,25 +334,58 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, typ, msg)
 		return
 	}
-
-	cost := ledger.Cost(presp.InputTokens, presp.OutputTokens, presp.CacheReadInputTokens, presp.CacheWriteInputTokens,
-		used.Price.InputPerMTok, used.Price.OutputPerMTok)
-	s.guard.Settle(reservation, cost)
-	ticket.Settle(cost, presp.InputTokens+presp.OutputTokens)
-	s.ledger.Record(ledger.Record{
-		RequestID: requestID, Alias: used.Alias, Provider: used.Provider, Upstream: used.Upstream,
-		User: userName(client, &req), InputTokens: presp.InputTokens, OutputTokens: presp.OutputTokens,
-		CacheReadTokens: presp.CacheReadInputTokens, CacheWriteTokens: presp.CacheWriteInputTokens,
-		CostUSD: cost, LatencyMS: time.Since(start).Milliseconds(), Status: "ok",
-	})
-
-	// Surface the provider/model that actually served the request, so a
-	// cross-provider failover is never invisible to the caller (data-residency).
+	s.recordSuccess(req, acct, used, presp)
 	w.Header().Set("X-Heave-Provider", used.Provider)
 	w.Header().Set("X-Heave-Upstream", used.Upstream)
-	// Respond with the alias the client requested (primary); the header above
-	// carries the real upstream when it differs.
-	writeJSON(w, http.StatusOK, toOpenAIResponse(requestID, primary.Alias, presp))
+	writeJSON(w, http.StatusOK, toOpenAIResponse(acct.requestID, acct.primaryAlias, presp))
+}
+
+func (s *Server) serveStreaming(ctx context.Context, w http.ResponseWriter, req *openai.ChatCompletionRequest, candidates []router.Decision, acct accounting) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		s.guard.Settle(acct.reservation, 0)
+		writeError(w, http.StatusInternalServerError, "api_error", "server writer does not support streaming")
+		return
+	}
+	sw := &sseWriter{w: w, fl: fl, id: acct.requestID, model: acct.primaryAlias}
+
+	presp, used, served, attempted, lastErr := s.runCandidates(ctx, req, candidates, acct,
+		func(prov provider.Provider, d router.Decision) (*provider.Response, error) {
+			sw.setCandidate(d) // written as X-Heave-* headers on the first delta
+			return prov.ChatCompletionStream(ctx, toProviderRequest(req, d), sw.writeDelta)
+		},
+		func() bool { return !sw.wroteAny }) // can only fail over before the first byte
+
+	if !served {
+		if sw.wroteAny {
+			// Bytes were already streamed (upstream failed mid-stream, or the
+			// client disconnected). The vendor billed us for what it generated, so
+			// FAIL CLOSED: charge the reserved estimate rather than releasing it —
+			// otherwise streaming + early disconnect would be a free firewall bypass.
+			s.guard.Settle(acct.reservation, acct.estUSD)
+			acct.ticket.Settle(acct.estUSD, acct.estTokens)
+			s.ledger.Record(ledger.Record{
+				RequestID: acct.requestID, Alias: acct.primaryAlias,
+				User: userName(acct.client, req), InputTokens: acct.estTokens,
+				CostUSD: acct.estUSD, LatencyMS: time.Since(acct.start).Milliseconds(), Status: "aborted",
+			})
+			sw.finishError(lastErr)
+			return
+		}
+		s.guard.Settle(acct.reservation, 0)
+		if !attempted {
+			writeError(w, http.StatusServiceUnavailable, "api_error", "no healthy provider available for this model")
+			return
+		}
+		status, typ, msg, retryAfter := classifyError(ctx, lastErr)
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		writeError(w, status, typ, msg)
+		return
+	}
+	s.recordSuccess(req, acct, used, presp)
+	sw.finish(presp)
 }
 
 // promptHash is a stable hash of the request's system + message content, used by
@@ -476,9 +567,6 @@ func (s *Server) denied(w http.ResponseWriter, client *controls.Client, err erro
 // unsupported reports a clear message (and false) when the request uses a
 // capability Phase 0 does not implement, so the gateway never pretends.
 func unsupported(req *openai.ChatCompletionRequest) (string, bool) {
-	if req.Stream {
-		return "streaming is not yet supported", false
-	}
 	if len(req.Tools) > 0 || len(req.Functions) > 0 {
 		return "tool/function calling is not yet supported", false
 	}
@@ -587,6 +675,113 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	writeJSON(w, status, openai.ErrorResponse{Error: openai.ErrorBody{Message: msg, Type: typ}})
+}
+
+// sseWriter emits an OpenAI-compatible chat.completion.chunk SSE stream. It
+// defers writing the 200 status + headers until the first delta, so a provider
+// that fails before any byte can still be failed over / returned as a JSON error.
+type sseWriter struct {
+	w        http.ResponseWriter
+	fl       http.Flusher
+	id       string
+	model    string
+	provider string
+	upstream string
+	wroteAny bool
+	created  int64
+}
+
+func (sw *sseWriter) setCandidate(d router.Decision) {
+	sw.provider, sw.upstream = d.Provider, d.Upstream
+}
+
+func (sw *sseWriter) start() error {
+	h := sw.w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Heave-Provider", sw.provider)
+	h.Set("X-Heave-Upstream", sw.upstream)
+	sw.w.WriteHeader(http.StatusOK)
+	sw.created = time.Now().Unix()
+	sw.wroteAny = true
+	return sw.emit(openai.ChatCompletionChunk{
+		ID: sw.chunkID(), Object: "chat.completion.chunk", Created: sw.created, Model: sw.model,
+		Choices: []openai.ChunkChoice{{Delta: openai.Delta{Role: "assistant"}}},
+	})
+}
+
+// writeDelta is the provider.StreamFunc; returning an error aborts the upstream
+// stream (e.g. the client disconnected and the write failed).
+func (sw *sseWriter) writeDelta(delta string) error {
+	if !sw.wroteAny {
+		if err := sw.start(); err != nil {
+			return err
+		}
+	}
+	return sw.emit(openai.ChatCompletionChunk{
+		ID: sw.chunkID(), Object: "chat.completion.chunk", Created: sw.created, Model: sw.model,
+		Choices: []openai.ChunkChoice{{Delta: openai.Delta{Content: delta}}},
+	})
+}
+
+func (sw *sseWriter) chunkID() string { return "chatcmpl-" + sw.id }
+
+func (sw *sseWriter) emit(chunk openai.ChatCompletionChunk) error {
+	b, _ := json.Marshal(chunk)
+	line := append([]byte("data: "), b...)
+	line = append(line, '\n', '\n')
+	_, err := sw.w.Write(line)
+	sw.fl.Flush()
+	return err
+}
+
+// finish emits the terminal finish_reason chunk, then a separate usage-only
+// chunk (choices:[]) matching OpenAI's include_usage shape, then [DONE].
+func (sw *sseWriter) finish(presp *provider.Response) {
+	if !sw.wroteAny {
+		_ = sw.start()
+	}
+	reason := presp.FinishReason
+	_ = sw.emit(openai.ChatCompletionChunk{
+		ID: sw.chunkID(), Object: "chat.completion.chunk", Created: sw.created, Model: sw.model,
+		Choices: []openai.ChunkChoice{{Delta: openai.Delta{}, FinishReason: &reason}},
+	})
+	_ = sw.emit(openai.ChatCompletionChunk{
+		ID: sw.chunkID(), Object: "chat.completion.chunk", Created: sw.created, Model: sw.model,
+		Choices: []openai.ChunkChoice{},
+		Usage: &openai.Usage{
+			PromptTokens: presp.InputTokens, CompletionTokens: presp.OutputTokens,
+			TotalTokens: presp.InputTokens + presp.OutputTokens,
+		},
+	})
+	sw.done()
+}
+
+// finishError ends an already-started stream with an error object then [DONE].
+// The status is already 200, so this is the only in-band way to signal a fault.
+// It does NOT leak the raw upstream message: only a normalized type + status.
+func (sw *sseWriter) finishError(err error) {
+	body := openai.ErrorBody{Message: "upstream request failed", Type: "api_error"}
+	var pe *provider.Error
+	if errors.As(err, &pe) {
+		if pe.Type != "" {
+			body.Type = pe.Type
+		}
+		if pe.StatusCode >= 400 {
+			body.Code = strconv.Itoa(pe.StatusCode)
+		}
+	}
+	b, _ := json.Marshal(openai.ErrorResponse{Error: body})
+	line := append([]byte("data: "), b...)
+	line = append(line, '\n', '\n')
+	_, _ = sw.w.Write(line)
+	sw.done()
+}
+
+func (sw *sseWriter) done() {
+	_, _ = sw.w.Write([]byte("data: [DONE]\n\n"))
+	sw.fl.Flush()
 }
 
 func newRequestID() string {

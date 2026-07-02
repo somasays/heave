@@ -59,3 +59,33 @@ func TestLiveAnthropicChatCompletion(t *testing.T) {
 	t.Logf("live ok: model=%s tokens=%d/%d content=%q",
 		resp.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Choices[0].Message.Content.Text)
 }
+
+// TestLiveAnthropicStreaming drives a real streaming request end-to-end and
+// checks the SSE framing + a real usage trailer. Skips without a key.
+func TestLiveAnthropicStreaming(t *testing.T) {
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		t.Skip("ANTHROPIC_API_KEY not set; skipping live streaming smoke test")
+	}
+	prov := provider.NewAnthropic("anthropic", key, "")
+	rtr := router.New([]router.ModelConfig{{
+		Alias: "smoke", Provider: "anthropic", Upstream: "claude-haiku-4-5",
+		Price: router.Price{InputPerMTok: 1, OutputPerMTok: 5}, MaxOutputTokens: 16, AcceptsSampling: true,
+	}}, "smoke")
+	srv := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"anthropic": prov}},
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: 60 * time.Second})
+
+	body := `{"model":"smoke","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}`
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("live stream failed: status %d body %s", rr.Code, rr.Body.String())
+	}
+	out := rr.Body.String()
+	if !strings.Contains(out, "data: [DONE]") || !strings.Contains(out, `"role":"assistant"`) || !strings.Contains(out, `"usage"`) {
+		t.Fatalf("stream missing framing/usage:\n%s", out)
+	}
+	t.Logf("live stream ok (%d bytes of SSE)", len(out))
+}

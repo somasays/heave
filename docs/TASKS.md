@@ -96,11 +96,18 @@ generalizing reserve/settle from monthly budgets to short time constants + run
 scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger).
 
 ## Phase 2R — Prerequisites (gate the guarantees at scale)
-- ⬜ **Streaming (SSE)** — real agentic/interactive traffic streams; today it's
-  rejected, so no target workload can even be evaluated.
+- ✅ **Streaming (SSE)** — OpenAI-compatible `stream:true` end-to-end (Anthropic
+  via SDK; OpenAI-compat via SSE relay). Pre-first-byte failover; mid-stream
+  abort / usage-omitting backends **fail closed** (charge the estimate) so
+  streaming can't be a free firewall bypass. Reviews: ✅ Go
+  (`docs/reviews/phase2r-streaming-go.md`) · ✅ SSE-compat
+  (`docs/reviews/phase2r-streaming-compat.md`).
 - ⬜ **Shared state store (Redis)** — move budgets/rate/health/velocity off
   per-instance memory; without it every guarantee is fiction at >1 replica
   (N× problem). Degrade safely (fail-open vs fail-closed is a policy choice).
+  Design behind a Store interface: in-memory default (hermetic tests), Redis
+  behind an opt-in integration tier (like the `live` build tag).
+  - ⬜ Deferred: 1 MiB SSE line cap; byte-based settlement for aborted streams.
 
 ## Phase 3F — Firewall primitives (the headline) — MVP DONE
 - ✅ **Run identity** — `X-Heave-Run-Id`, scope namespaced by the authenticated

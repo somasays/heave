@@ -43,6 +43,10 @@ type ModelConfig struct {
 	Price           Price
 	MaxOutputTokens int
 	AcceptsSampling bool
+	// Fallbacks are other aliases to try, in order, when this model's provider
+	// fails with a retryable error. One level deep (a fallback's own fallbacks
+	// are not chased).
+	Fallbacks []string
 }
 
 // Router maps aliases to routing decisions.
@@ -60,8 +64,8 @@ func New(models []ModelConfig, defaultAlias string) *Router {
 	return &Router{models: m, defaultAlias: defaultAlias}
 }
 
-// Route resolves the requested alias. An empty alias falls back to the
-// configured default. Unknown aliases are an error surfaced to the caller.
+// Route resolves the requested alias to its primary decision. An empty alias
+// falls back to the configured default. Unknown aliases are an error.
 func (r *Router) Route(alias string) (Decision, error) {
 	if alias == "" {
 		alias = r.defaultAlias
@@ -70,6 +74,36 @@ func (r *Router) Route(alias string) (Decision, error) {
 	if !ok {
 		return Decision{}, fmt.Errorf("unknown model %q", alias)
 	}
+	return decisionFor(mc), nil
+}
+
+// Candidates returns the ordered list of decisions to try for an alias: the
+// primary followed by its configured fallbacks (resolved, deduped). Callers try
+// them in order, skipping unhealthy providers and stopping on success or a
+// terminal (non-retryable) error.
+func (r *Router) Candidates(alias string) ([]Decision, error) {
+	if alias == "" {
+		alias = r.defaultAlias
+	}
+	mc, ok := r.models[alias]
+	if !ok {
+		return nil, fmt.Errorf("unknown model %q", alias)
+	}
+	out := []Decision{decisionFor(mc)}
+	seen := map[string]bool{mc.Alias: true}
+	for _, fb := range mc.Fallbacks {
+		if seen[fb] {
+			continue
+		}
+		if fmc, ok := r.models[fb]; ok {
+			out = append(out, decisionFor(fmc))
+			seen[fb] = true
+		}
+	}
+	return out, nil
+}
+
+func decisionFor(mc ModelConfig) Decision {
 	return Decision{
 		Provider:        mc.Provider,
 		Upstream:        mc.Upstream,
@@ -77,5 +111,5 @@ func (r *Router) Route(alias string) (Decision, error) {
 		Price:           mc.Price,
 		MaxOutputTokens: mc.MaxOutputTokens,
 		AcceptsSampling: mc.AcceptsSampling,
-	}, nil
+	}
 }

@@ -50,6 +50,16 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/controls must stay pure (no other internal packages)"
+        health-pure:
+          files: ["**/internal/health/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/health must stay pure (no other internal packages)"
+        redact-pure:
+          files: ["**/internal/redact/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/redact must stay pure (no other internal packages)"
 
         # The provider boundary faces outward (vendors) only. It must not depend
         # on the core inward, so failover/redaction/cost logic can wrap it later.

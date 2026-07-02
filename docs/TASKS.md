@@ -39,15 +39,26 @@ Invariant: Phase gate).
   per-instance (durable/shared store → Phase 3). Reviews: ✅ security
   (`docs/reviews/phase1-security.md`, FAIL→pass-with-follow-ups) · ✅ Go
   (`docs/reviews/phase1-go.md`).
-- ⬜ PII redaction pre-flight hook.
-- ⬜ Cross-provider failover with health tracking.
+- ✅ PII redaction pre-flight hook — `internal/redact` (regex, opt-in; email,
+  SSN, Luhn-gated credit card, phone, and secret families: AWS/GitHub/GCP/Slack/
+  JWT/PEM), applied to message content + `user` before dispatch; Invariant #7.
+- ✅ Cross-provider failover with health tracking — `internal/health` circuit
+  breaker + router `fallbacks` + server dispatch loop; Invariant #8. Records each
+  attempt; 401/403 fail over (→502, never client 401); 429 fails over without
+  opening the breaker; served provider surfaced via `X-Heave-*` headers.
+- Reviews (failover+redaction): ✅ Go (`docs/reviews/phase1-failover-go.md`) · ✅
+  security (`docs/reviews/phase1-failover-security.md`) — both pass-with-follow-ups.
 
-### Deferred from Phase 1 controls reviews
-- ⬜ Per-client rejection counters on /metrics (denials now logged, not counted).
+**Phase 1 complete.**
+
+### Deferred from Phase 1 reviews (tracked, not lost)
+- ⬜ Per-client rejection counters on /metrics (denials logged, not counted).
 - ⬜ Key revocation/expiry + hot config reload (leaked key is live until restart).
 - ⬜ Global (gateway-wide) rate + concurrency cap (only per-client today).
 - ⬜ Per-model / per-provider budgets; org/team hierarchy (flat per-client now).
-- ⬜ Settle billed failures at actual cost (currently released at 0).
+- ⬜ Settle billed failures at actual cost (failed attempts recorded, tokens 0).
+- ⬜ Per-attempt failover sub-deadline (one deadline shared across attempts).
+- ⬜ Per-alias "no cross-provider failover" flag (strict data-residency).
 
 ## Testing
 - ✅ Two-tier tests: hermetic gate (`make check`, `-race`) + live smoke tier

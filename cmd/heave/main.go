@@ -18,8 +18,10 @@ import (
 
 	"github.com/somasays/heave/internal/config"
 	"github.com/somasays/heave/internal/controls"
+	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/provider"
+	"github.com/somasays/heave/internal/redact"
 	"github.com/somasays/heave/internal/router"
 	"github.com/somasays/heave/internal/server"
 )
@@ -53,6 +55,7 @@ func run(configPath string, log *slog.Logger) error {
 			Price:           router.Price{InputPerMTok: m.Price.InputPerMTok, OutputPerMTok: m.Price.OutputPerMTok},
 			MaxOutputTokens: m.MaxOutputTokens,
 			AcceptsSampling: m.AcceptsSampling(),
+			Fallbacks:       m.Fallbacks,
 		})
 	}
 	rtr := router.New(models, cfg.Routing.DefaultModel)
@@ -70,7 +73,16 @@ func run(configPath string, log *slog.Logger) error {
 		log.Warn("authentication is DISABLED; do not expose this gateway to untrusted callers (set auth.enabled: true)")
 	}
 
-	srv := server.New(rtr, providers, led, guard, log, server.Options{
+	tracker := health.New(cfg.Failover.ConsecutiveFailures, cfg.Failover.Cooldown, nil)
+	redactor := redact.New(cfg.Redaction.Enabled, cfg.Redaction.CustomPatterns)
+	if redactor.Enabled() {
+		log.Info("PII redaction is enabled (regex-based, best-effort)")
+	}
+
+	srv := server.New(server.Deps{
+		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
+		Health: tracker, Redactor: redactor, Log: log,
+	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,
 	})

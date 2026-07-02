@@ -55,7 +55,18 @@ concurrent requests cannot all pass a stale pre-check and overshoot the cap.
 *Why:* a cost/abuse control that runs after the vendor call has already lost the
 money it was meant to save. *Caveat:* limits are in-memory and per-instance — N
 replicas allow N× the configured RPM/budget until the shared store lands
-(Phase 3); documented on the config fields and in `controls`.
+(Phase 3); documented on the config fields and in `controls`. Redaction
+(`internal/redact`) is also a pre-vendor hook: when enabled it scrubs PII/secrets
+from request content before dispatch. It is opt-in and regex-based best-effort —
+lossy, so never on by default.
+
+**#8 — Failover only on retryable failures, health-gated.** A model may declare
+ordered `fallbacks`. The server tries candidates in order, skipping providers
+whose circuit breaker (`internal/health`) is open, and stops on the first
+success. It fails over only on *retryable* errors — transport failures/timeouts,
+429, and 5xx — never on a 4xx client error, which would fail identically on every
+provider. *Why:* retrying a doomed request across providers wastes latency and
+money and can mask a real client bug.
 
 ---
 
@@ -69,10 +80,10 @@ cmd/heave            (composition root — wires everything, reads config)
     │  imports ▼
 internal/server        (request flow: admit ▸ translate ▸ route ▸ dispatch ▸ account)
     │  imports ▼
-internal/openai  internal/router  internal/ledger  internal/provider  internal/controls
-  (wire types)     (routing)        (accounting)      (vendor adapters)   (auth/rate/budget)
-        │               │                │                  │                  │
-        └── stdlib ─────┴────────────────┴──────────────────┴──────────────────┘
+internal/openai  internal/router  internal/ledger  internal/provider  internal/controls  internal/health  internal/redact
+  (wire types)     (routing)        (accounting)      (vendor adapters)   (auth/rate/budget) (circuit breaker) (PII scrub)
+        │               │                │                  │                  │                  │               │
+        └── stdlib ─────┴────────────────┴──────────────────┴──────────────────┴──────────────────┴───────────────┘
                                                     vendor SDKs ┘ (provider only, outward)
 
 internal/config        (loaded only by cmd/heave)
@@ -209,7 +220,8 @@ Fail-cheap ordering inside `scripts/check.sh`: gofmt → architecture grep → b
 | #4 secrets from env | `check_arch.sh` + `.gitignore` |
 | #5 every request accounted | `server`/`ledger` tests + review |
 | #6 config is data | `config` validation + review |
-| #7 controls before vendor | `controls`/`server` tests (auth/rate/budget) + `depguard` (controls-pure) |
+| #7 controls before vendor | `controls`/`server` tests (auth/rate/budget/redaction) + `depguard` (controls-/redact-pure) |
+| #8 failover only on retryable, health-gated | `health` tests + `server` failover tests + `depguard` (health-pure) |
 | #A2 composition root / #A3 interface ownership | `depguard` + review |
 | #A4 no global mutable state | `gochecknoglobals` |
 | #A5 context propagation | `noctx` + review |

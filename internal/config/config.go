@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -21,6 +22,25 @@ type Config struct {
 	Routing   Routing    `yaml:"routing"`
 	Auth      Auth       `yaml:"auth"`
 	Clients   []Client   `yaml:"clients"`
+	Failover  Failover   `yaml:"failover"`
+	Redaction Redaction  `yaml:"redaction"`
+}
+
+// Failover tunes the per-provider circuit breaker used during model failover.
+type Failover struct {
+	// ConsecutiveFailures opens a provider's breaker (default 3).
+	ConsecutiveFailures int `yaml:"consecutive_failures"`
+	// Cooldown is how long an opened breaker stays open (default 30s).
+	Cooldown time.Duration `yaml:"cooldown"`
+}
+
+// Redaction configures the pre-flight PII/secret scrubber.
+type Redaction struct {
+	// Enabled turns redaction on (default off — it is lossy).
+	Enabled bool `yaml:"enabled"`
+	// CustomPatterns maps a rule name to a Go regexp, applied after the
+	// built-in detectors (email, SSN, credit card, phone, API keys).
+	CustomPatterns map[string]string `yaml:"custom_patterns"`
 }
 
 // Auth toggles gateway authentication.
@@ -77,6 +97,8 @@ type Model struct {
 	// an omitted value defaults to true; set false for models that reject
 	// sampling params (e.g. Claude Opus 4.8 / Sonnet 5).
 	Sampling *bool `yaml:"sampling"`
+	// Fallbacks are other model ids to try, in order, on a retryable failure.
+	Fallbacks []string `yaml:"fallbacks"`
 }
 
 // AcceptsSampling reports whether the model accepts sampling params (default
@@ -152,11 +174,30 @@ func (c *Config) validate() error {
 			return fmt.Errorf("config: model %q references unknown provider %q", m.ID, m.Provider)
 		}
 	}
+	// Fallbacks must reference defined models and not the model itself.
+	for _, m := range c.Models {
+		for _, fb := range m.Fallbacks {
+			if fb == m.ID {
+				return fmt.Errorf("config: model %q lists itself as a fallback", m.ID)
+			}
+			if !aliases[fb] {
+				return fmt.Errorf("config: model %q has unknown fallback %q", m.ID, fb)
+			}
+		}
+	}
 	if c.Routing.DefaultModel != "" && !aliases[c.Routing.DefaultModel] {
 		return fmt.Errorf("config: default_model %q is not a defined model", c.Routing.DefaultModel)
 	}
 	if err := c.validateClients(); err != nil {
 		return err
+	}
+	for name, pat := range c.Redaction.CustomPatterns {
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("config: redaction custom_pattern %q is not a valid regexp: %w", name, err)
+		}
+	}
+	if c.Failover.ConsecutiveFailures < 0 {
+		return fmt.Errorf("config: failover.consecutive_failures must be >= 0")
 	}
 	return nil
 }

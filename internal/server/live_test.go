@@ -9,8 +9,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,8 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/somasays/heave/internal/controls"
-	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/openai"
 	"github.com/somasays/heave/internal/provider"
 	"github.com/somasays/heave/internal/router"
@@ -39,9 +35,8 @@ func TestLiveAnthropicChatCompletion(t *testing.T) {
 		Alias: "smoke", Provider: "anthropic", Upstream: "claude-haiku-4-5",
 		Price: router.Price{InputPerMTok: 1, OutputPerMTok: 5}, MaxOutputTokens: 16, AcceptsSampling: true,
 	}}, "smoke")
-	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := New(rtr, map[string]provider.Provider{"anthropic": prov}, ledger.New(discard),
-		controls.New(false, nil, nil), discard, Options{MaxRequestBytes: 1 << 20, RequestTimeout: 60 * time.Second})
+	srv := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"anthropic": prov}},
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: 60 * time.Second})
 
 	body := `{"model":"smoke","max_tokens":16,"messages":[{"role":"user","content":"Reply with the single word: pong"}]}`
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))

@@ -76,12 +76,15 @@ controls that stop damage *before* a vendor is billed — not after-the-fact
 dashboards or monthly caps. This generalizes the reserve/settle machinery
 (Invariant #7) from a monthly budget to short time constants and run scope:
 **velocity caps** ($/min and tokens/min per key/run, *reserved* at admit so
-concurrent requests cannot overshoot), **per-run kill switches**,
-**repeated-prompt detection** (a run resending the same prompt over a sliding
-window is likely a runaway — exact-hash, so a per-turn nonce defeats it; a
-heuristic, not a security control), **concurrency caps**, and (Phase 4F)
-**provider-quota brokering**. Run scope is namespaced by the authenticated key,
-so a spoofed `X-Heave-Run-Id` cannot kill or poison another caller's run. *Why:*
+concurrent requests cannot overshoot), a **hard per-run $ budget**
+(`max_usd_per_run`, cumulative — auto-kills a run once its spend would exceed the
+cap), **per-run kill switches** (manual + auto), **repeated-prompt detection** (a
+run resending the same prompt over a sliding window is likely a runaway —
+exact-hash, so a per-turn nonce or a growing context defeats it; a heuristic, not
+a security control — the per-run $ budget is the backstop for runaways it cannot
+see), **concurrency caps**, and (Phase 4F) **provider-quota brokering**. Run scope
+is namespaced by the authenticated key, so a spoofed `X-Heave-Run-Id` cannot kill
+or poison another caller's run. *Why:*
 a runaway agent burns five figures in hours — a monthly budget is the wrong time
 constant, and "failover after 429" doesn't arbitrate a shared quota. This is the
 acute, underserved pain where heave's pre-vendor / reserve-settle / Go-data-plane
@@ -104,7 +107,21 @@ off), never the client-controlled `user` field, so a run reserved by a request i
 the same run the kill endpoint can stop; run ids are charset-validated identically
 on the reserve and kill paths (no reservable-but-unkillable runs). It is only
 meaningful with **auth enabled** (with auth off all traffic shares the empty
-owner and the kill endpoint is unauthenticated — dev only).
+owner and the kill endpoint is unauthenticated — dev only). **Per-run controls**
+(the $ budget, loop detection, run-scoped velocity/kill) require the caller to
+send `X-Heave-Run-Id`; untagged traffic gets only the per-key velocity cap. The
+per-run $ budget is enforced on the reserved *estimate* over a run's *active*
+lifetime (state is idle-reclaimed, so a run idle beyond the eviction window
+restarts at zero) — a fast runaway backstop, **not** an absolute cap: actual spend
+can exceed it by ~one call's estimation error (input est is chars/4, not a strict
+upper bound; more under concurrency), and the per-client **monthly budget**
+(Invariant #7) is the absolute, non-evictable ceiling across idle gaps and run-id
+rotation.
+**What this validates (see the E2E in `internal/server/e2e_firewall_test.go` +
+the live twin):** a *bounded blast radius* for agentic overspend — pre-vendor,
+within one request of the trip — NOT a reduction of steady-state bill (that was
+the cache lever, demoted in ADR 0001). The honest number is the loss bound
+(`≤ threshold × per-call cost`), not a spend-reduction percentage.
 
 ---
 

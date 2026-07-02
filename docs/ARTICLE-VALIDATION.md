@@ -24,6 +24,21 @@ Status legend: ✅ implemented · 🟡 partial / scaffolded · ⬜ planned.
 | 12 | Enforce design in CI, not review | ✅ | `depguard` in `.golangci.yml` enforces the package layering (the Go analog of import-linter/ArchUnit); `scripts/check_arch.sh` enforces the vendor/secret boundary |
 | 13 | Version specs/prompts as code; protect main | ✅ | `CLAUDE.md`, `docs/INVARIANTS.md`, config all in VC; hooks + CI |
 
+## Honest claims (the wedge, measured not asserted)
+
+The runtime spend firewall is validated by an end-to-end counterfactual
+(`internal/server/e2e_firewall_test.go`, plus a `live`-tagged twin against real
+Anthropic): the same agent traffic with the firewall OFF vs ON, asserting that
+blocked requests never reach the vendor (`blocked == attempts − vendor_calls`).
+Adversarially reviewed (by Fable 5, `docs/reviews/phase3f-firewall-e2e-fable.md`),
+the claim is scoped precisely: heave bounds the *blast radius* of a runaway
+pre-vendor — it does **not** halve steady-state bill (that was the cache lever,
+demoted in ADR 0001). The reported metric is the loss bound, not a
+spend-reduction percentage. The E2E deliberately includes the *negative* result —
+loop detection is blind to a growing-context runaway — and shows the hard per-run
+$ budget as the backstop that catches it. Owning the limits is the point: an
+engineering artifact that only shows the flattering case isn't validation.
+
 ## The two meta-forces, in this repo
 
 - **Shorten feedback latency:** the identical `scripts/check.sh` runs locally, in

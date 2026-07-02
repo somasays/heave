@@ -127,8 +127,30 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
 - ✅ **Concurrency caps** — max in-flight per key/run.
 - ✅ **Repeated-prompt detection** — sliding-window (catches A/B alternation);
   exact-hash, so a per-turn nonce defeats it (heuristic, documented).
+- ✅ **Hard per-run $ budget** (`max_usd_per_run`) — cumulative, auto-kills a run
+  once its spend would exceed the cap; the backstop for changing-prompt runaways
+  loop detection can't see. Built on reserve/settle. (Fable review finding #2.)
+- ✅ **End-to-end validation** — `internal/server/e2e_firewall_test.go` (hermetic
+  OFF-vs-ON counterfactual: runaway/kill/velocity/growing-context/concurrent-burst,
+  asserting denials are pre-vendor) + a `live` twin against real Anthropic. Metric
+  reframed to a loss bound (not a spend-reduction %), with the honest negative on
+  growing-context loop detection shown explicitly.
 - Reviews: ✅ security (`docs/reviews/phase3f-firewall-security.md`, FAIL→fixed) ·
-  ✅ Go (`docs/reviews/phase3f-firewall-go.md`). In-memory/per-instance MVP.
+  ✅ Go (`docs/reviews/phase3f-firewall-go.md`) · ✅ strategic/E2E (Fable 5,
+  `docs/reviews/phase3f-firewall-e2e-fable.md`) · ✅ per-run-budget Go + security
+  (`docs/reviews/phase3f-firewall-budget-{go,security}.md`, PASS-with-nits→fixed).
+  In-memory/per-instance MVP.
+
+### Deferred from the E2E/Fable + budget reviews (tracked)
+- ⬜ Durable/cross-restart per-run budget (today: active-lifetime, idle-reclaimed;
+  monthly budget is the absolute backstop).
+- ⬜ Tokenizer-accurate cost estimate (today: chars/4 input heuristic — not a
+  strict upper bound, so per-run/velocity caps carry ~Nx slack on adversarial input).
+- ⬜ Hard-cap the scope map like the kill map (today: GC-triggered idle eviction;
+  a >50k distinct-run-id spray within the idle window can grow it past the cap).
+- ⬜ Growing-context / structural-similarity loop detection (beyond exact-hash).
+- ⬜ Guidance/middleware so stock agent frameworks send `X-Heave-Run-Id`
+  (per-run controls are inert without it).
 
 ### Deferred from firewall reviews (tracked)
 - 🟡 Cross-replica shared store (Phase 2R) — **kill is now shared** (Redis);

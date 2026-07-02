@@ -511,9 +511,13 @@ func redactRequest(r *redact.Redactor, req *openai.ChatCompletionRequest) map[st
 	return total
 }
 
-// estimate is an upper-bound cost (USD) and token count for a request on one
-// decision: estimated input tokens (rough chars/4) plus the resolved max output
-// tokens, at the model's price. Reconciled to the real values after the response.
+// estimate is a pre-flight cost (USD) and token count for a request on one
+// decision: estimated input tokens plus the resolved max output tokens, at the
+// model's price. Reconciled to the real values after the response. Output is a
+// true upper bound (capped by max_tokens); the INPUT term is a rough chars/4
+// heuristic, NOT a strict upper bound — adversarial/byte-heavy content can
+// tokenize higher, so a single call's actual cost may exceed this estimate. Any
+// firewall cap built on it (e.g. MaxUSDPerRun) inherits that slack.
 func estimate(preq *provider.Request, decision router.Decision) (usd float64, tokens int) {
 	chars := len(preq.System)
 	for _, m := range preq.Messages {

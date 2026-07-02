@@ -38,6 +38,13 @@ type Firewall struct {
 	// LoopThreshold auto-kills a run after it repeats the same prompt-prefix
 	// this many times (a runaway agent). 0 disables loop detection.
 	LoopThreshold int `yaml:"loop_threshold"`
+	// MaxUSDPerRun caps a single run's estimated spend over its ACTIVE lifetime
+	// (needs a run id): once a run's spend would exceed it the run is auto-killed.
+	// The backstop for runaways whose prompts keep changing (which loop detection
+	// cannot catch). Not an absolute cap — it is on the estimate and resets if a
+	// run idles out; the per-client monthly_budget_usd is the absolute ceiling.
+	// 0 disables it.
+	MaxUSDPerRun float64 `yaml:"max_usd_per_run"`
 	// RedisURL, when set (redis://host:port/db), shares run-kill state across
 	// replicas so a kill on one gateway stops the run on all. Velocity and
 	// concurrency remain per-instance for now. Empty = in-memory (single node).
@@ -222,7 +229,8 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: failover.consecutive_failures must be >= 0")
 	}
 	if c.Firewall.MaxUSDPerMin < 0 || c.Firewall.MaxTokensPerMin < 0 ||
-		c.Firewall.MaxConcurrent < 0 || c.Firewall.LoopThreshold < 0 {
+		c.Firewall.MaxConcurrent < 0 || c.Firewall.LoopThreshold < 0 ||
+		c.Firewall.MaxUSDPerRun < 0 {
 		return fmt.Errorf("config: firewall limits must be >= 0")
 	}
 	if c.Firewall.KillTTL < 0 {

@@ -92,6 +92,7 @@ func run(configPath string, log *slog.Logger) error {
 		MaxTokensPerMin: cfg.Firewall.MaxTokensPerMin,
 		MaxConcurrent:   cfg.Firewall.MaxConcurrent,
 		LoopThreshold:   cfg.Firewall.LoopThreshold,
+		MaxUSDPerRun:    cfg.Firewall.MaxUSDPerRun,
 		KillTTL:         killTTL,
 	}, nil)
 	if cfg.Firewall.RedisURL != "" {

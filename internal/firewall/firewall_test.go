@@ -363,3 +363,187 @@ func TestLoopTripSharedErrorIsObservable(t *testing.T) {
 		t.Fatal("a failed shared write on the auto-kill path must be observable")
 	}
 }
+
+// TestPerRunBudgetAutoKills: a hard cumulative per-run $ cap trips a kill once the
+// run would exceed it — the backstop for changing-prompt runaways loop detection
+// can't catch. The run never bills past the cap, and stays killed afterward.
+func TestPerRunBudgetAutoKills(t *testing.T) {
+	f := New(true, Limits{MaxUSDPerRun: 1.0}, nil)
+	// Distinct prompt hashes each time (loop detection would NOT fire) — only the
+	// cumulative budget catches this.
+	for i, est := range []float64{0.4, 0.4} {
+		tk, err := f.Enter("k", "run", "h"+string(rune('a'+i)), est, 0)
+		if err != nil {
+			t.Fatalf("call %d under budget must admit, got %v", i, err)
+		}
+		tk.Settle(est, 0)
+		tk.Release()
+	}
+	// Cumulative is 0.8; a third 0.4 would reach 1.2 > 1.0 → kill.
+	if _, err := f.Enter("k", "run", "hc", 0.4, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("exceeding the per-run budget must auto-kill, got %v", err)
+	}
+	// The run is now hard-killed: even a tiny request is refused.
+	if _, err := f.Enter("k", "run", "hd", 0.001, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("a budget-killed run must stay killed, got %v", err)
+	}
+	// A different run is unaffected (per-run scope).
+	if tk, err := f.Enter("k", "other", "he", 0.4, 0); err != nil {
+		t.Fatalf("an unrelated run must be admitted, got %v", err)
+	} else {
+		tk.Release()
+	}
+}
+
+// TestPerRunBudgetReleaseFreesReservation: a failed (unsettled) request must not
+// count toward the run's cumulative budget.
+func TestPerRunBudgetReleaseFreesReservation(t *testing.T) {
+	f := New(true, Limits{MaxUSDPerRun: 1.0}, nil)
+	tk, err := f.Enter("k", "run", "h1", 0.9, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Release() // failed request, never settled → releases the 0.9 hold
+	// The budget is free again: another 0.9 request must admit.
+	if tk2, err := f.Enter("k", "run", "h2", 0.9, 0); err != nil {
+		t.Fatalf("released reservation must free the per-run budget, got %v", err)
+	} else {
+		tk2.Release()
+	}
+}
+
+// TestPerRunBudgetSettlesToActual: the cumulative budget reconciles the reserved
+// estimate down to the actual spend, so an over-estimate doesn't strand budget.
+func TestPerRunBudgetSettlesToActual(t *testing.T) {
+	f := New(true, Limits{MaxUSDPerRun: 1.0}, nil)
+	tk, err := f.Enter("k", "run", "h1", 0.9, 0) // reserve 0.9
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Settle(0.2, 0) // actual only 0.2 → cumulative reconciles to 0.2
+	tk.Release()
+	// 0.8 of budget remains: a 0.7 request admits.
+	if tk2, err := f.Enter("k", "run", "h2", 0.7, 0); err != nil {
+		t.Fatalf("settle-to-actual must free the over-estimate, got %v", err)
+	} else {
+		tk2.Settle(0.7, 0)
+		tk2.Release()
+	}
+	// Now 0.9 cumulative; a 0.2 request would exceed → kill.
+	if _, err := f.Enter("k", "run", "h3", 0.2, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("cumulative should track settled actuals, got %v", err)
+	}
+}
+
+// TestPerRunBudgetNeedsRunID: without a run id there is no per-run scope, so the
+// budget cannot apply (documented prerequisite).
+func TestPerRunBudgetNeedsRunID(t *testing.T) {
+	f := New(true, Limits{MaxUSDPerRun: 0.1}, nil)
+	for i := 0; i < 5; i++ {
+		tk, err := f.Enter("k", "", "", 1.0, 0) // no run id, est way over the cap
+		if err != nil {
+			t.Fatalf("no-run-id traffic is not subject to the per-run budget, got %v", err)
+		}
+		tk.Settle(1.0, 0)
+		tk.Release()
+	}
+}
+
+// TestPerRunBudgetOvershootBoundedThenTrips is the honest limit (review MF-2): the
+// cap is on the ESTIMATE, so a call that bills MORE than estimated can push a run
+// over the cap — but settle keeps the accumulator accurate, so the overshoot is
+// bounded to that one call and the NEXT request trips.
+func TestPerRunBudgetOvershootBoundedThenTrips(t *testing.T) {
+	f := New(true, Limits{MaxUSDPerRun: 1.0}, nil)
+	tk, err := f.Enter("k", "run", "h1", 0.4, 0) // reserve only 0.4 …
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Settle(1.4, 0) // … but it actually cost 1.4 (underestimate): billed over the cap
+	tk.Release()
+	// The overshoot does not compound: the run is now over budget, so the next
+	// request is refused.
+	if _, err := f.Enter("k", "run", "h2", 0.01, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("an underestimated call over the cap must trip the next request, got %v", err)
+	}
+}
+
+// TestPerRunBudgetResetsAfterIdleEviction PINS the documented active-lifetime
+// behavior (review MF-1): a run's cumulative resets once its scope is idle-evicted
+// — this is intentional (bounded memory), and the monthly budget is the absolute
+// backstop.
+func TestPerRunBudgetResetsAfterIdleEviction(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	f := New(true, Limits{MaxUSDPerRun: 1.0}, clockAt(&now))
+	tk, err := f.Enter("k", "r", "h1", 0.9, 0) // spend near the cap
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Settle(0.9, 0)
+	tk.Release()
+	// Idle past the eviction window (and past gcInterval) with no activity on "r".
+	now = now.Add(idleEvictTTL + gcInterval + time.Second)
+	tk2, err := f.Enter("k", "other", "h2", 0.1, 0) // any Enter triggers gcLocked
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk2.Release()
+	// "r"'s scope was reclaimed, so its budget restarts: a fresh 0.9 admits again
+	// (it would be killed if the prior 0.9 still counted).
+	tk3, err := f.Enter("k", "r", "h3", 0.9, 0)
+	if err != nil {
+		t.Fatalf("an idle-evicted run must reset its per-run budget and re-admit, got %v", err)
+	}
+	tk3.Release()
+}
+
+// TestBudgetKilledRunStaysKilledAfterScopeEvicts: the KILL outlives the evictable
+// scope — a budget-killed run stays dead even after its runUSD accounting is
+// reclaimed (kill lives in the kill store with its own TTL).
+func TestBudgetKilledRunStaysKilledAfterScopeEvicts(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	f := New(true, Limits{MaxUSDPerRun: 1.0, KillTTL: 24 * time.Hour}, clockAt(&now))
+	tk, err := f.Enter("k", "r", "h1", 0.9, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Settle(0.9, 0)
+	tk.Release()
+	if _, err := f.Enter("k", "r", "h2", 0.2, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("run should be budget-killed, got %v", err)
+	}
+	now = now.Add(idleEvictTTL + gcInterval + time.Second)
+	if tk, err := f.Enter("k", "other", "h3", 0.1, 0); err == nil { // trigger gc
+		tk.Release()
+	}
+	if _, err := f.Enter("k", "r", "h4", 0.001, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("a budget-killed run must stay killed after its scope evicts, got %v", err)
+	}
+}
+
+// TestVelocityRejectDoesNotChargeRunBudget: a request rejected by a velocity cap
+// returns before the reserve loop, so it must not consume the per-run budget.
+func TestVelocityRejectDoesNotChargeRunBudget(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	f := New(true, Limits{MaxUSDPerMin: 0.5, MaxUSDPerRun: 1.0}, clockAt(&now))
+	tk, err := f.Enter("k", "r", "h1", 0.4, 0) // within velocity + budget
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk.Settle(0.4, 0)
+	tk.Release()
+	// Exceeds the $/min velocity cap (0.4+0.4 > 0.5) → rejected before any reserve.
+	if _, err := f.Enter("k", "r", "h2", 0.4, 0); !errors.As(err, new(*VelocityError)) {
+		t.Fatalf("want velocity rejection, got %v", err)
+	}
+	// Drain the velocity window (60s) but keep the run scope alive (< 120s idle).
+	// The run budget should reflect ONLY the one settled call (0.4), so a 0.5
+	// request still admits (0.9 ≤ 1.0). If the rejected call had been charged
+	// (0.8), this would trip.
+	now = now.Add(90 * time.Second)
+	tk3, err := f.Enter("k", "r", "h3", 0.5, 0)
+	if err != nil {
+		t.Fatalf("a velocity-rejected call must not charge the per-run budget, got %v", err)
+	}
+	tk3.Release()
+}

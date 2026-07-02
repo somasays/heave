@@ -108,6 +108,11 @@ firewall:
   max_tokens_per_min: 0     # rolling tokens/min cap
   max_concurrent: 0         # max in-flight requests per key/run
   loop_threshold: 8         # auto-kill a run after N identical prompt-prefixes (runaway)
+  max_usd_per_run: 0        # per-run $ budget (needs X-Heave-Run-Id): auto-kills the run when
+                            # its ESTIMATED active-lifetime spend would exceed this. The backstop
+                            # for changing-prompt runaways loop detection can't see. Not absolute
+                            # (est-based, resets if the run idles out) — monthly_budget_usd is the
+                            # absolute ceiling. 0 disables.
   # Share run-kill state across replicas (a kill on one gateway stops the run on
   # all). A kill is written to BOTH a local map and Redis, so a locally-issued
   # kill still holds if Redis blips. Velocity/concurrency stay per-instance for

@@ -82,6 +82,24 @@ type Limits struct {
 	// LoopThreshold auto-kills a run after the same prompt hash recurs this many
 	// times within a recent-history window. 0 disables it.
 	LoopThreshold int
+	// MaxUSDPerRun caps a single run's ESTIMATED spend over its ACTIVE lifetime:
+	// once a run's reserved+settled spend would exceed the cap, the run is
+	// auto-KILLED. It is the backstop for a changing-prompt runaway that loop
+	// detection cannot see. Three caveats keep the claim honest (it is NOT an
+	// absolute hard cap):
+	//   - Enforced on the reserved ESTIMATE. Output is bounded by the request's
+	//     max_tokens (set max_output_tokens per model), but the input estimate is
+	//     a chars/4 heuristic, NOT a strict upper bound — adversarial input can
+	//     tokenize higher, so a single admitted call may bill above its estimate.
+	//     A run can thus exceed the cap by ~one call's estimation error, or more
+	//     if MaxConcurrent admits several in-flight at once — pair the two, and a
+	//     tokenizer-accurate estimate tightens it.
+	//   - ACTIVE lifetime: a run's accounting is reclaimed when its scope goes
+	//     idle (gcLocked), so a run idle beyond the eviction window restarts at
+	//     zero. The per-client MONTHLY budget (Invariant #7) is the absolute,
+	//     non-evictable backstop across idle gaps and run-id rotation.
+	//   - Requires a run id (per-run scope); 0 disables it.
+	MaxUSDPerRun float64
 	// KillTTL bounds how long a kill is remembered (local + shared). 0 = default.
 	KillTTL time.Duration
 }
@@ -135,6 +153,10 @@ type scopeState struct {
 	window    *window
 	inflight  int
 	lastTouch time.Time
+	// runUSD is the CUMULATIVE reserved+settled spend for a run scope (never
+	// windowed); used only when MaxUSDPerRun is set. It is reclaimed with the
+	// scope when the run goes idle, so it caps a run's ACTIVE lifetime spend.
+	runUSD float64
 }
 
 type loopState struct {
@@ -296,10 +318,13 @@ func (f *Firewall) Enabled() bool { return f.enabled }
 type Ticket struct {
 	fw        *Firewall
 	scopeKeys []string
-	estUSD    float64
-	estTokens int
-	released  bool
-	settled   bool
+	// runScopeKey is the run scope's map key when a per-run budget is tracked
+	// ("" otherwise), so Settle/Release can reconcile the cumulative runUSD.
+	runScopeKey string
+	estUSD      float64
+	estTokens   int
+	released    bool
+	settled     bool
 }
 
 // Enter is the pre-vendor gate: kill/loop checks, then a velocity + concurrency
@@ -321,8 +346,13 @@ func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estToken
 
 	ticket, tripped, err := f.enterLocked(key, runID, runKey, promptHash, estUSD, estTokens)
 	if tripped {
-		// Loop detection tripped: kill the run (local + shared) outside the lock,
-		// since the shared store may do network I/O.
+		// An auto-kill trip (loop detection OR per-run budget): kill the run
+		// (local + shared) outside the lock, since the shared store may do network
+		// I/O. Unlike the manual Kill endpoint (which surfaces a write failure as
+		// 5xx), the auto paths intentionally swallow doKill's error — the local
+		// kill still records, and if it couldn't (map full) the next request
+		// re-trips and retries; KillRejections/SharedKillErrors stay observable via
+		// Stats.
 		_ = f.doKill(runKey)
 		return nil, ErrKilled
 	}
@@ -343,6 +373,19 @@ func (f *Firewall) enterLocked(key, runID, runKey, promptHash string, estUSD flo
 		return nil, true, nil
 	}
 
+	// Per-run cumulative budget: if this request would push the run over its hard
+	// $ cap, KILL the run (trip) — this is the backstop for runaways whose prompts
+	// keep changing, which loop detection cannot see.
+	if runKey != "" && f.limits.MaxUSDPerRun > 0 {
+		spent := 0.0
+		if st := f.scopes[runKey]; st != nil {
+			spent = st.runUSD
+		}
+		if spent+estUSD > f.limits.MaxUSDPerRun {
+			return nil, true, nil
+		}
+	}
+
 	keys := f.scopeKeys(key, runID)
 	// Check every scope first (all-or-nothing), then reserve.
 	for _, sk := range keys {
@@ -357,14 +400,18 @@ func (f *Firewall) enterLocked(key, runID, runKey, promptHash string, estUSD flo
 			}
 		}
 	}
-	mapKeys := make([]string, 0, len(keys))
+	tk = &Ticket{fw: f, scopeKeys: make([]string, 0, len(keys)), estUSD: estUSD, estTokens: estTokens}
 	for _, sk := range keys {
 		st := f.ensureScopeLocked(sk.mapKey, now)
 		st.window.add(now.Unix(), estUSD, estTokens) // reserve the estimate
 		st.inflight++
-		mapKeys = append(mapKeys, sk.mapKey)
+		tk.scopeKeys = append(tk.scopeKeys, sk.mapKey)
+		if sk.name == "run" && f.limits.MaxUSDPerRun > 0 {
+			st.runUSD += estUSD // reserve against the cumulative per-run budget
+			tk.runScopeKey = sk.mapKey
+		}
 	}
-	return &Ticket{fw: f, scopeKeys: mapKeys, estUSD: estUSD, estTokens: estTokens}, false, nil
+	return tk, false, nil
 }
 
 // Settle reconciles the held estimate to the actual spend (delta into the same
@@ -375,7 +422,10 @@ func (tk *Ticket) Settle(actualUSD float64, actualTokens int) {
 	}
 	tk.fw.mu.Lock()
 	defer tk.fw.mu.Unlock()
-	if tk.settled {
+	// Settle must run before Release (the handler does; defer Release fires after).
+	// Guard against a released-then-settled ordering, which would double-unwind the
+	// reservation and drive runUSD negative.
+	if tk.settled || tk.released {
 		return
 	}
 	tk.settled = true
@@ -383,6 +433,15 @@ func (tk *Ticket) Settle(actualUSD float64, actualTokens int) {
 	for _, mk := range tk.scopeKeys {
 		if st := tk.fw.scopes[mk]; st != nil {
 			st.window.add(now, actualUSD-tk.estUSD, actualTokens-tk.estTokens)
+		}
+	}
+	// Reconcile the cumulative per-run budget from the reserved estimate to actual.
+	if tk.runScopeKey != "" {
+		if st := tk.fw.scopes[tk.runScopeKey]; st != nil {
+			st.runUSD += actualUSD - tk.estUSD
+			if st.runUSD < 0 {
+				st.runUSD = 0
+			}
 		}
 	}
 }
@@ -410,6 +469,16 @@ func (tk *Ticket) Release() {
 		}
 		if !tk.settled {
 			st.window.add(now, -tk.estUSD, -tk.estTokens) // release the hold
+		}
+	}
+	// A failed (unsettled) request releases its cumulative per-run reservation too,
+	// so a run isn't charged for spend that never happened.
+	if !tk.settled && tk.runScopeKey != "" {
+		if st := tk.fw.scopes[tk.runScopeKey]; st != nil {
+			st.runUSD -= tk.estUSD
+			if st.runUSD < 0 {
+				st.runUSD = 0
+			}
 		}
 	}
 }

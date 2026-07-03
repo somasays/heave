@@ -19,6 +19,8 @@ heave is the enforcement point that does.
 A runaway agent hammering the same request on one run. The firewall kills the run
 after the threshold — every later call is refused **before it reaches the vendor**:
 
+![heave kills a runaway agent, pre-vendor](demo/heave-demo.gif)
+
 ```
 $ ./demo/runaway.sh          # firewall ON: loop_threshold=3, max_usd_per_run=$0.01
 

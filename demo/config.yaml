@@ -1,0 +1,39 @@
+# Demo config for `demo/runaway.sh`. Firewall ON with a tight loop threshold and a
+# hard per-run $ budget, so a runaway agent is killed in seconds — PRE-vendor.
+# The client key here is a throwaway DEMO key (never use in production).
+server:
+  addr: ":8080"
+
+providers:
+  - name: anthropic
+    type: anthropic
+    api_key_env: ANTHROPIC_API_KEY   # export your key before running
+
+models:
+  - id: fast
+    provider: anthropic
+    upstream: claude-haiku-4-5
+    price: { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+    max_output_tokens: 64
+
+routing:
+  default_model: fast
+
+# Auth ON: the firewall's run scope is keyed to the authenticated client, so a
+# spoofed run id can't touch another caller's run. Bearer for the demo is
+# "heave-demo-key" (its SHA-256 is below).
+auth:
+  enabled: true
+
+clients:
+  - name: agent
+    key_sha256: "0f362a0481480a5e4f0849468a05c7a04d4d9fe9a650de3202e1c4541b7d18e7"
+    monthly_budget_usd: 0     # unlimited — we want the FIREWALL to be the only gate
+    rate_limit_rpm: 0
+    admin: true               # so the demo can read /v1/stats
+
+# The wedge: hard, real-time, pre-vendor enforcement.
+firewall:
+  enabled: true
+  loop_threshold: 3           # auto-kill a run after 3 identical prompts (runaway)
+  max_usd_per_run: 0.01       # hard per-run $ backstop for changing-prompt runaways

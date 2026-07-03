@@ -1,48 +1,48 @@
-# Phase 5 (attribution + built-in dashboard) — review status
+# Phase 5 increment 1 (attribution + built-in dashboard) — reviews
 
-**IMPORTANT — the two adversarial expert reviews for this increment did NOT run.**
-Both subagents (Go reviewer, security reviewer) terminated on a provider session
-limit before producing findings. Per the phase-gate DoD (docs/INVARIANTS.md), a
-phase is done only after BOTH an LLM-apps/security review and a Go review pass.
-So **Phase 5 is code-complete but its adversarial reviews are DEFERRED** and must
-be run before it is marked done. This file records the interim self-review so the
-gap is explicit, not hidden.
+**Status: reviews COMPLETE.** The two adversarial expert reviews initially failed
+to run (provider session limit) and were re-run once the limit reset. Both
+returned **PASS-WITH-NITS, no must-fix**. Nits from both were folded.
 
-## Self-review (author, not a substitute for the two adversarial passes)
+## Go review — PASS-WITH-NITS
+Verified sound: Record/Snapshot concurrency (both under `l.mu`, value-copies
+returned — race-clean under `-race`); ring modular indexing at wraparound and
+partial fill; overflow bucket reconciles to the grand total; runID threaded
+through all three spend-recording paths (success, error, aborted); `requireAdmin`
+correct for auth-off / bad-key / non-admin / admin; `NamedStat` JSON flattens.
 
-Scope: `internal/ledger` (attribution aggregation + recent ring + Snapshot),
-`internal/server` (handleStats/handleDashboard + admin gate + runID threading),
-`internal/server/dashboard.html`.
+Nits folded:
+- Overflow/anonymous sentinel keys could collide with a client literally named
+  `(other)`/`(anonymous)` → NUL-prefixed sentinels (`\x00(other)`, `\x00(anonymous)`),
+  stripped for display.
+- `recentN` was `int64` (a theoretical wrap → negative ring index → panic on the
+  write path) → changed to `uint64` (index can never be negative).
+- `/v1/stats` consumed the admin key's chat rate-limit bucket → added
+  `controls.Guard.Authenticate` (auth without touching the bucket); `requireAdmin`
+  uses it.
+- Test gaps filled: partial-fill newest-first order, overflow reconciles
+  cost+tokens, runID on the error record, auth-off `/v1/stats` open.
 
-### Addressed proactively
-- **Cross-tenant exposure (the sharp risk).** `/v1/stats` returns every tenant's
-  spend/attribution + run ids. Gated behind an **admin** key when auth is enabled
-  (`requireAdmin`): no key → 401, non-admin key → 403, admin → 200. Auth-off (dev)
-  is open (startup already warns loudly). The `/dashboard` **shell** stays open
-  (contains no data); the page prompts for an admin key and sends it as a bearer
-  on the `/v1/stats` fetch (sessionStorage, not URL/localStorage). Test:
-  `TestStatsRequiresAdminWhenAuthEnabled`.
-- **Stored XSS.** `user` (request field, NOT charset-validated) and `run_id` flow
-  into the recent-activity table; the page escapes every interpolated value via
-  `esc()` (`&<>"`) before `innerHTML`.
-- **Concurrency.** Record (writes `*Stat`) and Snapshot (reads `*Stat` into a value
-  copy) both hold `l.mu`; verified race-free under `-race`
-  (`TestSnapshotConcurrentWithRecord`).
-- **Bounds.** by-user/by-run maps capped at `maxTracked` with an overflow bucket
-  (grand total always reconciles); recent is a fixed 200-slot ring.
-  `TestOverflowBucketBoundsMapAndReconciles`, `TestRecentRingNewestFirstAndBounded`.
-- Attribution threaded through all three spend-recording paths (success,
-  candidate-error, streaming-aborted).
+## Security review — PASS-WITH-NITS
+Verified: admin gate correct + sufficient (401/403/200); `/dashboard` shell and
+`/metrics` carry no per-tenant data; sessionStorage token handling sound (bearer
+only, never URL/log); **stored XSS closed** — every client-controlled value
+(`user`, `run_id`, `alias`, …) is `esc()`-escaped before `innerHTML`, all sinks
+are text nodes; run-id enumeration + snapshot-sort DoS both neutralized by the
+admin gate; exposure + auth-off posture documented.
 
-### Known open items for the deferred adversarial reviews to weigh
-- `/v1/stats` sorts up to `maxTracked` entries per poll (3s) — now admin-gated, so
-  not an unauthenticated amplification vector, but a brief snapshot cache could be
-  considered.
-- Run-id enumeration by an admin is inherent to the feature (admin is trusted).
-- Whether `/metrics` (aggregate only, no per-tenant names) should also be gated.
+Nits folded:
+- Snapshot sorted under `l.mu` (contends the billing hot path) → sorts now run
+  AFTER releasing the lock (only the map/ring copy is under the lock).
+- `esc()` didn't escape `'` → added (`&#39;`), future-proofing against a
+  single-quoted-attribute sink.
+- Fail-open default (a config with no `auth` section serves `/v1/stats` open):
+  consistent with the gateway's documented dev posture (chat is open too); the
+  shipped `config.example.yaml` ships auth ENABLED and fail-closed.
 
 ## Follow-ups (tracked)
 - Durable Postgres ledger behind the same `Record` call (the "attribution" half of
   Phase 5 not yet built — this increment is in-memory only).
-- Near-limit-run / quota-headroom panels (needs firewall/broker to expose live
-  scope snapshots).
+- Near-limit-run / quota-headroom dashboard panels (needs firewall/broker to
+  expose live scope snapshots).
+- Optional brief Snapshot cache if poll volume grows.

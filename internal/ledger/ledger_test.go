@@ -96,9 +96,25 @@ func TestOverflowBucketBoundsMapAndReconciles(t *testing.T) {
 	if _, ok := l.byUser[overflowKey]; !ok {
 		t.Fatal("overflow beyond the cap must fold into the overflow bucket")
 	}
-	// The grand total is always exact regardless of per-dimension capping.
-	if l.Snapshot(0).Total.Requests != int64(n) {
-		t.Fatalf("total must count every record, got %d", l.Snapshot(0).Total.Requests)
+	// The grand total is always exact regardless of per-dimension capping —
+	// requests, tokens, AND cost.
+	tot := l.Snapshot(0).Total
+	if tot.Requests != int64(n) {
+		t.Fatalf("total requests must count every record, got %d", tot.Requests)
+	}
+	if math.Abs(tot.CostUSD-float64(n)) > 1e-9 {
+		t.Fatalf("total cost must reconcile despite capping, got %v want %d", tot.CostUSD, n)
+	}
+}
+
+func TestRecentPartialFillNewestFirst(t *testing.T) {
+	l := discardLedger()
+	for i := 0; i < 3; i++ { // fewer than recentRing → partial-fill branch
+		l.Record(Record{User: "u", CostUSD: float64(i)})
+	}
+	rec := l.Snapshot(10).Recent
+	if len(rec) != 3 || rec[0].CostUSD != 2 || rec[2].CostUSD != 0 {
+		t.Fatalf("partial ring must be newest-first, got %+v", rec)
 	}
 }
 

@@ -191,10 +191,10 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   `GET /v1/stats` (admin-gated) + a self-contained `GET /dashboard` (open shell,
   fetches the gated data with an admin bearer). runID threaded through all spend
   records. XSS-escaped; race-clean; endpoint + ledger tests.
-  **⚠ Adversarial reviews DEFERRED** — both reviewers hit a provider session limit
-  and produced no findings; a self-review is recorded in
-  `docs/reviews/phase5-dashboard-status.md`. Per the DoD, the Go + security passes
-  MUST run before this phase is marked done.
+  Reviews: ✅ Go · ✅ security (`docs/reviews/phase5-dashboard-status.md`, both
+  PASS-with-nits → folded: NUL-sentinel keys, uint64 ring index, auth-without-rate
+  for observability reads, sort-outside-lock, `esc()` single-quote, test gaps).
+  (Reviews initially failed on a provider session limit; re-run after reset.)
 - ⬜ Durable ledger (Postgres) attributed by org/team/key/**run** (this increment
   is in-memory only).
 - ⬜ Dashboard: near-limit runs, quota headroom (needs firewall/broker live scope

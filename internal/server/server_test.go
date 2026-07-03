@@ -694,3 +694,36 @@ func TestStatsRequiresAdminWhenAuthEnabled(t *testing.T) {
 		t.Fatalf("dashboard shell must stay open, got %d", drr.Code)
 	}
 }
+
+func TestErrorRecordCarriesRunAttribution(t *testing.T) {
+	// Non-retryable error → an "error" ledger record on the same run, no failover.
+	fp := &fakeProvider{err: &provider.Error{StatusCode: 400, Type: "invalid_request_error", Message: "bad"}}
+	h := testServer(t, fp, true, time.Second)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Heave-Run-Id", "run-err")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code == 200 {
+		t.Fatal("expected the request to fail")
+	}
+	// /v1/stats (auth off → open) must attribute the failed request to its run.
+	sr := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/stats", nil)
+	srr := httptest.NewRecorder()
+	h.ServeHTTP(srr, sr)
+	if srr.Code != 200 {
+		t.Fatalf("/v1/stats with auth off must be open, got %d", srr.Code)
+	}
+	var stats struct {
+		Recent []struct {
+			RunID  string `json:"run_id"`
+			Status string `json:"status"`
+		} `json:"recent"`
+	}
+	if err := json.Unmarshal(srr.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(stats.Recent) == 0 || stats.Recent[0].RunID != "run-err" || stats.Recent[0].Status != "error" {
+		t.Fatalf("error record must carry run attribution, got %+v", stats.Recent)
+	}
+}

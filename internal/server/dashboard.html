@@ -64,7 +64,7 @@
 const $=id=>document.getElementById(id);
 const usd=n=>'$'+(n||0).toFixed(4);
 const num=n=>(n||0).toLocaleString();
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function rows(tb,arr,cells,empty){
   if(!arr||!arr.length){tb.innerHTML='<tr><td class="empty" colspan="8">'+empty+'</td></tr>';return;}
   tb.innerHTML=arr.map(cells).join('');

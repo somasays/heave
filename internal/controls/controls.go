@@ -124,6 +124,21 @@ func (g *Guard) Admit(bearer string) (*Client, error) {
 	return &c, nil
 }
 
+// Authenticate verifies a bearer WITHOUT consuming the client's rate-limit bucket
+// — for non-chat control-plane reads (e.g. the observability endpoints) that must
+// not eat the key's chat RPM. Returns (nil, nil) when auth is disabled.
+func (g *Guard) Authenticate(bearer string) (*Client, error) {
+	if !g.authEnabled {
+		return nil, nil
+	}
+	st := g.lookup(bearer)
+	if st == nil {
+		return nil, ErrUnauthorized
+	}
+	c := st.cfg
+	return &c, nil
+}
+
 // Reserve holds estUSD (an upper-bound cost estimate) against the client's
 // monthly budget, atomically. It rejects with *BudgetError if the hold would
 // exceed the cap. A nil client (auth disabled) or a 0 budget reserves nothing

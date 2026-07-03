@@ -23,8 +23,12 @@ const (
 	// maxTracked bounds the by-client and by-run maps so a caller rotating run ids
 	// cannot OOM the ledger; spend for keys past the cap folds into an overflow
 	// bucket so the per-dimension sums still reconcile to the grand total.
-	maxTracked  = 20_000
-	overflowKey = "(other)"
+	maxTracked = 20_000
+	// Sentinel bucket keys are NUL-prefixed so a client literally named "(other)"
+	// or "(anonymous)" cannot collide with them (a NUL cannot appear in a config
+	// client name and is vanishingly unlikely in a request `user` field).
+	overflowKey  = "\x00(other)"
+	anonymousKey = "\x00(anonymous)"
 	// recentRing is how many recent events the dashboard can show.
 	recentRing = 200
 )
@@ -90,12 +94,14 @@ type Snapshot struct {
 type Ledger struct {
 	log *slog.Logger
 
-	mu      sync.Mutex
-	total   Stat
-	byUser  map[string]*Stat
-	byRun   map[string]*Stat
-	recent  [recentRing]Event
-	recentN int64 // total events seen (recent index = recentN % recentRing)
+	mu     sync.Mutex
+	total  Stat
+	byUser map[string]*Stat
+	byRun  map[string]*Stat
+	recent [recentRing]Event
+	// recentN is the total number of events seen (unsigned so the modular ring
+	// index can never go negative — a signed wrap would panic on the write path).
+	recentN uint64
 }
 
 // New builds a Ledger that logs through the given slog.Logger.
@@ -110,7 +116,7 @@ func (l *Ledger) Record(r Record) {
 
 	l.mu.Lock()
 	l.total.add(tokens, r.CostUSD)
-	trackLocked(l.byUser, keyOr(r.User, "(anonymous)"), tokens, r.CostUSD)
+	trackLocked(l.byUser, keyOr(r.User, anonymousKey), tokens, r.CostUSD)
 	if r.RunID != "" {
 		trackLocked(l.byRun, r.RunID, tokens, r.CostUSD)
 	}
@@ -169,23 +175,34 @@ func (l *Ledger) Totals() (requests int64, tokens int64, costUSD float64) {
 
 // Snapshot returns a bounded, read-only view for the dashboard: grand totals, the
 // top-n spenders by client and by run, and the most recent events (newest first).
+// The map/ring copies happen under the lock, but the (potentially large) sorts run
+// AFTER releasing it, so the billing hot path is never blocked on sorting.
 func (l *Ledger) Snapshot(topN int) Snapshot {
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	total := l.total
+	users := collectLocked(l.byUser)
+	runs := collectLocked(l.byRun)
+	recent := l.recentLocked()
+	l.mu.Unlock()
 	return Snapshot{
-		Total:    l.total,
-		TopUsers: topLocked(l.byUser, topN),
-		TopRuns:  topLocked(l.byRun, topN),
-		Recent:   l.recentLocked(),
+		Total:    total,
+		TopUsers: topN_(users, topN),
+		TopRuns:  topN_(runs, topN),
+		Recent:   recent,
 	}
 }
 
-// topLocked returns the n highest-cost entries of m, descending. Assumes locked.
-func topLocked(m map[string]*Stat, n int) []NamedStat {
+// collectLocked copies m into a slice of value stats. Assumes the lock is held.
+func collectLocked(m map[string]*Stat) []NamedStat {
 	all := make([]NamedStat, 0, len(m))
 	for k, st := range m {
-		all = append(all, NamedStat{Name: k, Stat: *st})
+		all = append(all, NamedStat{Name: displayName(k), Stat: *st})
 	}
+	return all
+}
+
+// topN_ sorts entries by descending cost and truncates to n. Lock-free.
+func topN_(all []NamedStat, n int) []NamedStat {
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].CostUSD != all[j].CostUSD {
 			return all[i].CostUSD > all[j].CostUSD
@@ -198,14 +215,22 @@ func topLocked(m map[string]*Stat, n int) []NamedStat {
 	return all
 }
 
-// recentLocked returns the recent ring, newest first. Assumes locked.
+// displayName strips the NUL prefix from sentinel bucket keys for presentation.
+func displayName(k string) string {
+	if len(k) > 0 && k[0] == 0 {
+		return k[1:]
+	}
+	return k
+}
+
+// recentLocked returns the recent ring, newest first. Assumes the lock is held.
 func (l *Ledger) recentLocked() []Event {
 	n := l.recentN
 	if n > recentRing {
 		n = recentRing
 	}
 	out := make([]Event, 0, n)
-	for i := int64(0); i < n; i++ {
+	for i := uint64(0); i < n; i++ {
 		idx := (l.recentN - 1 - i) % recentRing
 		out = append(out, l.recent[idx])
 	}

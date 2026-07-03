@@ -186,7 +186,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 // auth is disabled (dev), access is open — the startup path already warns loudly
 // that auth is off. Returns true when the request may proceed.
 func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
-	client, err := s.guard.Admit(bearerToken(r))
+	// Authenticate (not Admit) so a 3s dashboard poll doesn't consume the admin
+	// key's chat rate-limit bucket.
+	client, err := s.guard.Authenticate(bearerToken(r))
 	if err != nil {
 		s.denied(w, nil, err)
 		return false

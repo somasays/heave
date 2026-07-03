@@ -80,6 +80,19 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/redisstore must not import other internal packages (it implements interfaces structurally)"
+        pgledger-boundary:
+          files: ["**/internal/pgledger/**"]
+          # A durable-sink adapter depends only on the ledger's Record type it
+          # persists; it must not reach up into orchestration/logic packages.
+          deny:
+            - pkg: github.com/somasays/heave/internal/server
+            - pkg: github.com/somasays/heave/internal/router
+            - pkg: github.com/somasays/heave/internal/provider
+            - pkg: github.com/somasays/heave/internal/firewall
+            - pkg: github.com/somasays/heave/internal/broker
+            - pkg: github.com/somasays/heave/internal/controls
+            - pkg: github.com/somasays/heave/internal/config
+            - pkg: github.com/somasays/heave/internal/redisstore
         cachebench-pure:
           files: ["**/internal/cachebench/**"]
           deny:

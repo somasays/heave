@@ -75,6 +75,24 @@ routing:
   # Alias used when a request omits `model`.
   default_model: fast
 
+# Durable spend ledger (Phase 5). When database_url is set, every billable record
+# is also persisted to Postgres (batched asynchronously; dropped-with-a-counter
+# under backpressure so accounting never blocks the request path — see /metrics
+# ledger_dropped). Empty = in-memory aggregates + structured log only. Runs behind
+# the compose `state` profile.
+ledger:
+  # The secret-bearing connection string lives in an ENV VAR, never here
+  # (Invariant #4), like provider API keys:
+  # database_url_env: DATABASE_URL
+  #   e.g. export DATABASE_URL="postgres://gateway:gateway@db:5432/gateway?sslmode=require"
+  # Set sslmode=require (or verify-full) for a REMOTE database — pgx otherwise
+  # defaults to sslmode=prefer, which silently falls back to plaintext.
+  #
+  # Operator notes: the durable `spend` table stores per-request METADATA only
+  # (no message content) — but the client-supplied `user` field can itself be PII
+  # and is retained indefinitely. Apply your own retention/partitioning policy;
+  # under sustained load the table grows one row per request.
+
 # Gateway authentication + per-client controls (Phase 1). When enabled, callers
 # must send `Authorization: Bearer <key>`; auth, rate limits, and budgets are
 # enforced BEFORE any vendor call (Invariant #7).

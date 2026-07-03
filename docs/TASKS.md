@@ -195,10 +195,17 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   PASS-with-nits → folded: NUL-sentinel keys, uint64 ring index, auth-without-rate
   for observability reads, sort-outside-lock, `esc()` single-quote, test gaps).
   (Reviews initially failed on a provider session limit; re-run after reset.)
-- ⬜ Durable ledger (Postgres) attributed by org/team/key/**run** (this increment
-  is in-memory only).
+- ✅ **Durable Postgres ledger** — `internal/pgledger`, a `ledger.Sink` behind the
+  same `Record` call: async batched `CopyFrom`, bounded buffer → drop-with-a-
+  counter under backpressure (best-effort, never blocks the request path; loss
+  observable via `/metrics` ledger_dropped). Secret DSN from `database_url_env`
+  (Invariant #4); sslmode warning; NUL-sanitized; panic-free lifecycle. Hermetic
+  tests (injected flush) + integration tier (`make integration`, verified vs
+  PG14). Reviews: ✅ Go (`docs/reviews/phase5-pgledger-go.md`, PASS-with-nits) ·
+  ✅ security (`docs/reviews/phase5-pgledger-security.md`, FAIL→fixed).
 - ⬜ Dashboard: near-limit runs, quota headroom (needs firewall/broker live scope
-  snapshots); spend-velocity panel.
+  snapshots); spend-velocity panel. Durable-ledger retention/partitioning +
+  event-time column + query API over Postgres (today the sink is write-only).
 
 ## Carried-over deferred items (from Phase 0/1 reviews — still live)
 - ⬜ Per-client/route rejection + velocity counters on /metrics.

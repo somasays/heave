@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
+	"github.com/somasays/heave/internal/pgledger"
 	"github.com/somasays/heave/internal/provider"
 	"github.com/somasays/heave/internal/redact"
 	"github.com/somasays/heave/internal/redisstore"
@@ -64,6 +66,29 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	rtr := router.New(models, cfg.Routing.DefaultModel)
 	led := ledger.New(log)
+	if cfg.Ledger.DatabaseURLEnv != "" {
+		dbURL := os.Getenv(cfg.Ledger.DatabaseURLEnv)
+		if dbURL == "" {
+			log.Warn("ledger.database_url_env is set but the env var is empty; durable ledger OFF", "env", cfg.Ledger.DatabaseURLEnv)
+		} else {
+			if !strings.Contains(dbURL, "sslmode=require") && !strings.Contains(dbURL, "sslmode=verify") {
+				// pgx defaults to sslmode=prefer, which silently falls back to
+				// PLAINTEXT — the durable store holds client attribution + costs.
+				log.Warn("durable ledger DSN has no sslmode=require; a remote Postgres connection may transmit in plaintext — set sslmode=require")
+			}
+			pgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			sink, err := pgledger.New(pgCtx, dbURL)
+			cancel()
+			if err != nil {
+				// Don't wrap the raw error — it can echo the connection string
+				// (with the password). Surface only that durable persistence failed.
+				return fmt.Errorf("durable ledger: could not connect to the configured database")
+			}
+			defer func() { _ = sink.Close() }()
+			led.WithSink(sink)
+			log.Info("durable spend ledger enabled (postgres)")
+		}
+	}
 
 	clients := make([]controls.Client, 0, len(cfg.Clients))
 	for _, c := range cfg.Clients {

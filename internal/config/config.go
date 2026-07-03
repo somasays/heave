@@ -25,6 +25,7 @@ type Config struct {
 	Failover  Failover   `yaml:"failover"`
 	Redaction Redaction  `yaml:"redaction"`
 	Firewall  Firewall   `yaml:"firewall"`
+	Ledger    Ledger     `yaml:"ledger"`
 }
 
 // Firewall configures the runtime spend & quota firewall (Invariant #9): hard,
@@ -154,6 +155,18 @@ type Price struct {
 // Routing holds routing policy.
 type Routing struct {
 	DefaultModel string `yaml:"default_model"`
+}
+
+// Ledger configures durable spend persistence. Empty = in-memory only.
+type Ledger struct {
+	// DatabaseURLEnv names the environment variable holding the Postgres
+	// connection string (postgres://user:pass@host:port/db). Like provider API
+	// keys (Invariant #4), the secret-bearing URL is read from the ENVIRONMENT,
+	// never written in the config file. When set (and the env var is non-empty)
+	// the durable Postgres ledger is enabled: records are batched asynchronously
+	// and dropped-with-a-counter under backpressure so accounting never blocks the
+	// request path. Empty = in-memory aggregates + structured log only.
+	DatabaseURLEnv string `yaml:"database_url_env"`
 }
 
 // Load reads and validates the config file at path.

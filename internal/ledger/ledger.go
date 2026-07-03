@@ -90,9 +90,17 @@ type Snapshot struct {
 	Recent   []Event     `json:"recent"`
 }
 
+// Sink durably persists records (e.g. Postgres). Write MUST be non-blocking and
+// best-effort — accounting must never fail or slow the request path, so a sink
+// that can't keep up drops (and counts) rather than blocking here.
+type Sink interface {
+	Write(Record)
+}
+
 // Ledger accumulates spend and emits structured records.
 type Ledger struct {
-	log *slog.Logger
+	log  *slog.Logger
+	sink Sink
 
 	mu     sync.Mutex
 	total  Stat
@@ -107,6 +115,13 @@ type Ledger struct {
 // New builds a Ledger that logs through the given slog.Logger.
 func New(log *slog.Logger) *Ledger {
 	return &Ledger{log: log, byUser: map[string]*Stat{}, byRun: map[string]*Stat{}}
+}
+
+// WithSink attaches a durable sink (e.g. Postgres) that every record is also
+// written to. Only the composition root should call this, once, before serving.
+func (l *Ledger) WithSink(s Sink) *Ledger {
+	l.sink = s
+	return l
 }
 
 // Record persists one billable event. It never returns an error: accounting is
@@ -126,6 +141,10 @@ func (l *Ledger) Record(r Record) {
 	}
 	l.recentN++
 	l.mu.Unlock()
+
+	if l.sink != nil {
+		l.sink.Write(r) // non-blocking durable persist (best-effort)
+	}
 
 	l.log.Info("request",
 		"request_id", r.RequestID,
@@ -164,6 +183,19 @@ func keyOr(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// droppable is implemented by durable sinks that shed records under backpressure.
+type droppable interface{ Dropped() uint64 }
+
+// SinkDropped reports records the durable sink lost to backpressure/outage (0 if
+// no sink, or the sink doesn't track drops). Surfaced on /metrics so durability
+// loss is observable.
+func (l *Ledger) SinkDropped() uint64 {
+	if d, ok := l.sink.(droppable); ok {
+		return d.Dropped()
+	}
+	return 0
 }
 
 // Totals returns the running aggregates, used by the /metrics endpoint.

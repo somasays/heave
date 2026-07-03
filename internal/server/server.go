@@ -177,6 +177,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"firewall_scope_degraded": fw.ScopeDegraded,
 		// Provider-quota brokering admits that failed open (shared store unreachable).
 		"broker_scope_degraded": s.broker.Degraded(),
+		// Records the durable ledger shed under backpressure/outage (0 if none).
+		"ledger_dropped": s.ledger.SinkDropped(),
 	})
 }
 

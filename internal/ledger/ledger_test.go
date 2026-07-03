@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -136,5 +137,27 @@ func TestSnapshotConcurrentWithRecord(t *testing.T) {
 		default:
 			_ = l.Snapshot(10) // read while writes are in flight
 		}
+	}
+}
+
+type fakeSink struct {
+	mu  sync.Mutex
+	got []Record
+}
+
+func (f *fakeSink) Write(r Record) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.got = append(f.got, r)
+}
+
+func TestLedgerForwardsToSink(t *testing.T) {
+	f := &fakeSink{}
+	l := discardLedger().WithSink(f)
+	l.Record(Record{RequestID: "x", User: "u", CostUSD: 1})
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.got) != 1 || f.got[0].RequestID != "x" {
+		t.Fatalf("record must be forwarded to the sink, got %+v", f.got)
 	}
 }

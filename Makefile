@@ -31,6 +31,10 @@ test: ## Run tests only
 smoke: ## Run LIVE smoke tests against real provider APIs (needs API keys; costs money)
 	@go test -tags live -run Live -count=1 ./...
 
+.PHONY: integration
+integration: ## Run integration tests against real state stores (needs HEAVE_TEST_DATABASE_URL; compose --profile state)
+	@go test -tags integration -run Integration -count=1 ./...
+
 .PHONY: bench
 bench: ## Run the cache-aware routing cost simulation (deterministic, offline)
 	@go run ./cmd/cachebench

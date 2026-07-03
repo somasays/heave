@@ -186,9 +186,19 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   concurrency dimension; single-node local fast path.
 
 ## Phase 5 — Attribution & visibility (was "spend dashboard")
-- ⬜ Durable ledger (Postgres) attributed by org/team/key/**run**.
-- ⬜ Dashboard framed around the firewall: spend velocity, near-limit runs,
-  kills, top burners, cache-hit rate as a secondary efficiency panel.
+- 🟡 **Attribution + built-in dashboard** (in-memory) — the ledger aggregates
+  spend by client and by run (bounded + overflow bucket) with a recent-event ring;
+  `GET /v1/stats` (admin-gated) + a self-contained `GET /dashboard` (open shell,
+  fetches the gated data with an admin bearer). runID threaded through all spend
+  records. XSS-escaped; race-clean; endpoint + ledger tests.
+  **⚠ Adversarial reviews DEFERRED** — both reviewers hit a provider session limit
+  and produced no findings; a self-review is recorded in
+  `docs/reviews/phase5-dashboard-status.md`. Per the DoD, the Go + security passes
+  MUST run before this phase is marked done.
+- ⬜ Durable ledger (Postgres) attributed by org/team/key/**run** (this increment
+  is in-memory only).
+- ⬜ Dashboard: near-limit runs, quota headroom (needs firewall/broker live scope
+  snapshots); spend-velocity panel.
 
 ## Carried-over deferred items (from Phase 0/1 reviews — still live)
 - ⬜ Per-client/route rejection + velocity counters on /metrics.

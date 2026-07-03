@@ -613,3 +613,84 @@ func TestRateLimitReturns429(t *testing.T) {
 		t.Fatalf("second: want 429 with Retry-After, got %d ra=%q", rr.Code, rr.Header().Get("Retry-After"))
 	}
 }
+
+func TestStatsAndDashboardEndpoints(t *testing.T) {
+	h := testServer(t, &fakeProvider{resp: &provider.Response{Content: "ok", InputTokens: 5, OutputTokens: 5, FinishReason: "stop"}}, true, time.Second)
+	// Drive one request so the ledger has attribution to report.
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Heave-Run-Id", "run-xyz")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("seed request failed: %d", rr.Code)
+	}
+
+	// /v1/stats reflects the request.
+	sr := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/stats", nil)
+	srr := httptest.NewRecorder()
+	h.ServeHTTP(srr, sr)
+	if srr.Code != 200 {
+		t.Fatalf("/v1/stats want 200, got %d", srr.Code)
+	}
+	var stats struct {
+		Total struct {
+			Requests int64 `json:"requests"`
+		} `json:"total"`
+		Recent []struct {
+			RunID string `json:"run_id"`
+		} `json:"recent"`
+	}
+	if err := json.Unmarshal(srr.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if stats.Total.Requests < 1 {
+		t.Fatal("/v1/stats must report the request")
+	}
+	if len(stats.Recent) == 0 || stats.Recent[0].RunID != "run-xyz" {
+		t.Fatalf("/v1/stats recent must carry the run attribution, got %+v", stats.Recent)
+	}
+
+	// /dashboard serves self-contained HTML.
+	dr := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/dashboard", nil)
+	drr := httptest.NewRecorder()
+	h.ServeHTTP(drr, dr)
+	if drr.Code != 200 || !strings.Contains(drr.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("/dashboard want 200 html, got %d %q", drr.Code, drr.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(drr.Body.String(), "/v1/stats") {
+		t.Fatal("dashboard must poll /v1/stats")
+	}
+}
+
+func TestStatsRequiresAdminWhenAuthEnabled(t *testing.T) {
+	h := authServer(t, []controls.Client{
+		{Name: "ops", KeySHA256: sha("adminkey"), Admin: true},
+		{Name: "tenant", KeySHA256: sha("tenantkey")},
+	})
+	get := func(bearer string) int {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/stats", nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr.Code
+	}
+	if code := get(""); code != http.StatusUnauthorized {
+		t.Fatalf("no key must be 401, got %d", code)
+	}
+	if code := get("tenantkey"); code != http.StatusForbidden {
+		t.Fatalf("a non-admin tenant must not read cross-tenant stats (403), got %d", code)
+	}
+	if code := get("adminkey"); code != 200 {
+		t.Fatalf("admin key must read stats (200), got %d", code)
+	}
+	// The dashboard SHELL stays open (no data in it).
+	dr := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/dashboard", nil)
+	drr := httptest.NewRecorder()
+	h.ServeHTTP(drr, dr)
+	if drr.Code != 200 {
+		t.Fatalf("dashboard shell must stay open, got %d", drr.Code)
+	}
+}

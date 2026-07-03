@@ -87,6 +87,9 @@ type Client struct {
 	KeySHA256        string  `yaml:"key_sha256"`
 	MonthlyBudgetUSD float64 `yaml:"monthly_budget_usd"`
 	RateLimitRPM     int     `yaml:"rate_limit_rpm"`
+	// Admin grants access to the cross-tenant observability endpoints (/v1/stats,
+	// /dashboard), which expose every tenant's spend/attribution. Off by default.
+	Admin bool `yaml:"admin"`
 }
 
 // Server holds listen and hardening configuration.

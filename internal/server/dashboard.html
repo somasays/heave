@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heave · spend firewall</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--line:#21262d;--fg:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--warn:#d29922;--bad:#f85149;--ok:#3fb950}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:baseline;gap:.75rem;padding:1rem 1.25rem;border-bottom:1px solid var(--line)}
+  header h1{margin:0;font-size:1.05rem;letter-spacing:.02em}
+  header .sub{color:var(--dim);font-size:.8rem}
+  header .spacer{flex:1}
+  #status{font-size:.78rem;color:var(--dim)}
+  main{padding:1.25rem;max-width:1100px;margin:0 auto}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem;margin-bottom:1.25rem}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.85rem 1rem}
+  .card .label{color:var(--dim);font-size:.72rem;text-transform:uppercase;letter-spacing:.06em}
+  .card .val{font-size:1.5rem;font-weight:600;margin-top:.15rem;font-variant-numeric:tabular-nums}
+  .card .val.warn{color:var(--warn)} .card .val.bad{color:var(--bad)} .card .val.ok{color:var(--ok)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr}}
+  section h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 .5rem}
+  table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+  th{color:var(--dim);font-weight:500;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+  tr:last-child td{border-bottom:none}
+  td.num,th.num{text-align:right}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem}
+  .pill{display:inline-block;padding:.05rem .4rem;border-radius:999px;font-size:.72rem}
+  .pill.ok{background:rgba(63,185,80,.15);color:var(--ok)}
+  .pill.err{background:rgba(248,81,73,.15);color:var(--bad)}
+  .pill.aborted{background:rgba(210,153,34,.15);color:var(--warn)}
+  .empty{color:var(--dim);padding:.6rem .7rem}
+  footer{color:var(--dim);font-size:.75rem;text-align:center;padding:1.5rem 0 2rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>heave</h1><span class="sub">runtime spend &amp; quota firewall</span>
+  <span class="spacer"></span>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <div class="cards">
+    <div class="card"><div class="label">Spend</div><div class="val" id="cost">$0.0000</div></div>
+    <div class="card"><div class="label">Requests</div><div class="val" id="reqs">0</div></div>
+    <div class="card"><div class="label">Tokens</div><div class="val" id="toks">0</div></div>
+    <div class="card"><div class="label">Live kills</div><div class="val" id="kills">0</div></div>
+    <div class="card"><div class="label">Kill rejections</div><div class="val" id="killrej">0</div></div>
+    <div class="card"><div class="label">Degraded (fail-open)</div><div class="val" id="degraded">0</div></div>
+  </div>
+  <div class="grid2">
+    <section><h2>Top spend by client</h2><table><thead><tr><th>Client</th><th class="num">Reqs</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody id="users"></tbody></table></section>
+    <section><h2>Top spend by run</h2><table><thead><tr><th>Run</th><th class="num">Reqs</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody id="runs"></tbody></table></section>
+  </div>
+  <section style="margin-top:1.25rem"><h2>Recent activity</h2>
+    <table><thead><tr><th>Client</th><th>Run</th><th>Model</th><th>Provider</th><th class="num">Tokens</th><th class="num">Cost</th><th class="num">ms</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table>
+  </section>
+</main>
+<footer>polls <span class="mono">/v1/stats</span> every 3s · <span class="mono">/metrics</span> for Prometheus-style counters</footer>
+<script>
+const $=id=>document.getElementById(id);
+const usd=n=>'$'+(n||0).toFixed(4);
+const num=n=>(n||0).toLocaleString();
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function rows(tb,arr,cells,empty){
+  if(!arr||!arr.length){tb.innerHTML='<tr><td class="empty" colspan="8">'+empty+'</td></tr>';return;}
+  tb.innerHTML=arr.map(cells).join('');
+}
+function setHealth(el,v){el.textContent=num(v);el.className='val'+(v>0?' bad':'');}
+function authHeaders(){
+  const k=sessionStorage.getItem('heave_key');
+  return k?{Authorization:'Bearer '+k}:{};
+}
+async function tick(){
+  try{
+    const r=await fetch('/v1/stats',{cache:'no-store',headers:authHeaders()});
+    if(r.status===401||r.status===403){
+      const k=prompt('Admin API key (observability is restricted):');
+      if(k){sessionStorage.setItem('heave_key',k);return tick();}
+      $('status').textContent='admin key required';return;
+    }
+    if(!r.ok)throw new Error(r.status);
+    const d=await r.json();
+    const t=d.total||{};
+    $('cost').textContent=usd(t.cost_usd);$('reqs').textContent=num(t.requests);$('toks').textContent=num(t.tokens);
+    const fw=d.firewall||{};
+    $('kills').textContent=num(fw.LocalKills);
+    setHealth($('killrej'),fw.KillRejections);
+    setHealth($('degraded'),(fw.ScopeDegraded||0)+(d.broker_scope_degraded||0)+(fw.SharedKillErrors||0));
+    rows($('users'),d.top_users,u=>`<tr><td class="mono">${esc(u.name)}</td><td class="num">${num(u.requests)}</td><td class="num">${num(u.tokens)}</td><td class="num">${usd(u.cost_usd)}</td></tr>`,'no spend yet');
+    rows($('runs'),d.top_runs,u=>`<tr><td class="mono">${esc(u.name)}</td><td class="num">${num(u.requests)}</td><td class="num">${num(u.tokens)}</td><td class="num">${usd(u.cost_usd)}</td></tr>`,'no run-tagged traffic');
+    rows($('recent'),d.recent,e=>{
+      const cls=e.status==='ok'?'ok':e.status==='aborted'?'aborted':'err';
+      return `<tr><td class="mono">${esc(e.user||'(anon)')}</td><td class="mono">${esc(e.run_id||'—')}</td><td>${esc(e.alias)}</td><td>${esc(e.provider)}</td><td class="num">${num(e.tokens)}</td><td class="num">${usd(e.cost_usd)}</td><td class="num">${num(e.latency_ms)}</td><td><span class="pill ${cls}">${esc(e.status)}</span></td></tr>`;
+    },'no requests yet');
+    $('status').textContent='updated '+new Date().toLocaleTimeString();
+  }catch(err){$('status').textContent='disconnected ('+err.message+')';}
+}
+tick();setInterval(tick,3000);
+</script>
+</body>
+</html>

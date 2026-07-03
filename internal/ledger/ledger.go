@@ -1,12 +1,14 @@
 // Package ledger records per-request spend. Every dispatched request MUST be
 // recorded here (docs/INVARIANTS.md, Invariant #5) so cost is always
-// attributable. Phase 0 emits a structured JSON log line and keeps an in-memory
-// running total; Phase 3 adds a Postgres-backed durable ledger behind the same
-// Record call.
+// attributable. It emits a structured JSON log line and keeps in-memory
+// aggregates — grand totals plus spend attributed by client and by agent run —
+// and a bounded ring of recent events for the built-in dashboard. A Postgres
+// durable sink behind the same Record call is a tracked follow-up.
 package ledger
 
 import (
 	"log/slog"
+	"sort"
 	"sync"
 )
 
@@ -17,6 +19,16 @@ const (
 	cacheWriteMultiplier = 1.25
 )
 
+const (
+	// maxTracked bounds the by-client and by-run maps so a caller rotating run ids
+	// cannot OOM the ledger; spend for keys past the cap folds into an overflow
+	// bucket so the per-dimension sums still reconcile to the grand total.
+	maxTracked  = 20_000
+	overflowKey = "(other)"
+	// recentRing is how many recent events the dashboard can show.
+	recentRing = 200
+)
+
 // Record is a single billable event.
 type Record struct {
 	RequestID        string
@@ -24,6 +36,7 @@ type Record struct {
 	Provider         string
 	Upstream         string
 	User             string
+	RunID            string
 	InputTokens      int
 	OutputTokens     int
 	CacheReadTokens  int
@@ -33,28 +46,79 @@ type Record struct {
 	Status           string
 }
 
+// Stat is an aggregate over some dimension.
+type Stat struct {
+	Requests int64   `json:"requests"`
+	Tokens   int64   `json:"tokens"`
+	CostUSD  float64 `json:"cost_usd"`
+}
+
+func (s *Stat) add(tokens int64, cost float64) {
+	s.Requests++
+	s.Tokens += tokens
+	s.CostUSD += cost
+}
+
+// Event is a compact recent-activity entry for the dashboard.
+type Event struct {
+	RequestID string  `json:"request_id"`
+	Alias     string  `json:"alias"`
+	Provider  string  `json:"provider"`
+	User      string  `json:"user"`
+	RunID     string  `json:"run_id,omitempty"`
+	Tokens    int     `json:"tokens"`
+	CostUSD   float64 `json:"cost_usd"`
+	LatencyMS int64   `json:"latency_ms"`
+	Status    string  `json:"status"`
+}
+
+// NamedStat is an aggregate labelled by its dimension key (client or run id).
+type NamedStat struct {
+	Name string `json:"name"`
+	Stat
+}
+
+// Snapshot is a read-only view for the dashboard / attribution endpoint.
+type Snapshot struct {
+	Total    Stat        `json:"total"`
+	TopUsers []NamedStat `json:"top_users"`
+	TopRuns  []NamedStat `json:"top_runs"`
+	Recent   []Event     `json:"recent"`
+}
+
 // Ledger accumulates spend and emits structured records.
 type Ledger struct {
 	log *slog.Logger
 
-	mu        sync.Mutex
-	totalUSD  float64
-	requests  int64
-	totalToks int64
+	mu      sync.Mutex
+	total   Stat
+	byUser  map[string]*Stat
+	byRun   map[string]*Stat
+	recent  [recentRing]Event
+	recentN int64 // total events seen (recent index = recentN % recentRing)
 }
 
 // New builds a Ledger that logs through the given slog.Logger.
 func New(log *slog.Logger) *Ledger {
-	return &Ledger{log: log}
+	return &Ledger{log: log, byUser: map[string]*Stat{}, byRun: map[string]*Stat{}}
 }
 
 // Record persists one billable event. It never returns an error: accounting is
 // best-effort and must never fail the request path.
 func (l *Ledger) Record(r Record) {
+	tokens := int64(r.InputTokens + r.OutputTokens + r.CacheReadTokens + r.CacheWriteTokens)
+
 	l.mu.Lock()
-	l.totalUSD += r.CostUSD
-	l.requests++
-	l.totalToks += int64(r.InputTokens + r.OutputTokens + r.CacheReadTokens + r.CacheWriteTokens)
+	l.total.add(tokens, r.CostUSD)
+	trackLocked(l.byUser, keyOr(r.User, "(anonymous)"), tokens, r.CostUSD)
+	if r.RunID != "" {
+		trackLocked(l.byRun, r.RunID, tokens, r.CostUSD)
+	}
+	l.recent[l.recentN%recentRing] = Event{
+		RequestID: r.RequestID, Alias: r.Alias, Provider: r.Provider, User: r.User,
+		RunID: r.RunID, Tokens: int(tokens), CostUSD: r.CostUSD, LatencyMS: r.LatencyMS, Status: r.Status,
+	}
+	l.recentN++
 	l.mu.Unlock()
 
 	l.log.Info("request",
@@ -63,6 +127,7 @@ func (l *Ledger) Record(r Record) {
 		"provider", r.Provider,
 		"upstream", r.Upstream,
 		"user", r.User,
+		"run_id", r.RunID,
 		"input_tokens", r.InputTokens,
 		"output_tokens", r.OutputTokens,
 		"cache_read_tokens", r.CacheReadTokens,
@@ -73,11 +138,78 @@ func (l *Ledger) Record(r Record) {
 	)
 }
 
+// trackLocked adds to m[key], folding overflow into a shared bucket once the map
+// is at capacity so the map stays bounded and the per-dimension sums still
+// reconcile to the grand total. Assumes the ledger lock is held.
+func trackLocked(m map[string]*Stat, key string, tokens int64, cost float64) {
+	if _, ok := m[key]; !ok && len(m) >= maxTracked {
+		key = overflowKey
+	}
+	st := m[key]
+	if st == nil {
+		st = &Stat{}
+		m[key] = st
+	}
+	st.add(tokens, cost)
+}
+
+func keyOr(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
 // Totals returns the running aggregates, used by the /metrics endpoint.
 func (l *Ledger) Totals() (requests int64, tokens int64, costUSD float64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.requests, l.totalToks, l.totalUSD
+	return l.total.Requests, l.total.Tokens, l.total.CostUSD
+}
+
+// Snapshot returns a bounded, read-only view for the dashboard: grand totals, the
+// top-n spenders by client and by run, and the most recent events (newest first).
+func (l *Ledger) Snapshot(topN int) Snapshot {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return Snapshot{
+		Total:    l.total,
+		TopUsers: topLocked(l.byUser, topN),
+		TopRuns:  topLocked(l.byRun, topN),
+		Recent:   l.recentLocked(),
+	}
+}
+
+// topLocked returns the n highest-cost entries of m, descending. Assumes locked.
+func topLocked(m map[string]*Stat, n int) []NamedStat {
+	all := make([]NamedStat, 0, len(m))
+	for k, st := range m {
+		all = append(all, NamedStat{Name: k, Stat: *st})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CostUSD != all[j].CostUSD {
+			return all[i].CostUSD > all[j].CostUSD
+		}
+		return all[i].Name < all[j].Name // stable tiebreak
+	})
+	if n > 0 && len(all) > n {
+		all = all[:n]
+	}
+	return all
+}
+
+// recentLocked returns the recent ring, newest first. Assumes locked.
+func (l *Ledger) recentLocked() []Event {
+	n := l.recentN
+	if n > recentRing {
+		n = recentRing
+	}
+	out := make([]Event, 0, n)
+	for i := int64(0); i < n; i++ {
+		idx := (l.recentN - 1 - i) % recentRing
+		out = append(out, l.recent[idx])
+	}
+	return out
 }
 
 // Cost computes USD spend for a request from token counts and a price table.

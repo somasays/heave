@@ -69,7 +69,7 @@ func run(configPath string, log *slog.Logger) error {
 	for _, c := range cfg.Clients {
 		clients = append(clients, controls.Client{
 			Name: c.Name, KeySHA256: c.KeySHA256,
-			MonthlyBudgetUSD: c.MonthlyBudgetUSD, RateLimitRPM: c.RateLimitRPM,
+			MonthlyBudgetUSD: c.MonthlyBudgetUSD, RateLimitRPM: c.RateLimitRPM, Admin: c.Admin,
 		})
 	}
 	guard := controls.New(cfg.Auth.Enabled, clients, nil)

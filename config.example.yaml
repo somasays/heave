@@ -98,6 +98,8 @@ clients:
     key_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
     monthly_budget_usd: 100     # 0 = unlimited
     rate_limit_rpm: 60          # 0 = unlimited
+    # admin: true               # grants /v1/stats + /dashboard (cross-tenant spend
+                                 # attribution). Off by default; only ops keys.
 
 # Cross-provider failover circuit breaker: after N consecutive failures a
 # provider is skipped for `cooldown` before being retried.

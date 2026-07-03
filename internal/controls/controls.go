@@ -59,6 +59,8 @@ type Client struct {
 	// starts full, so a client may burst up to RPM immediately, then sustains
 	// RPM/min thereafter.
 	RateLimitRPM int
+	// Admin grants access to cross-tenant observability endpoints.
+	Admin bool
 }
 
 // Guard authenticates callers and enforces their limits.

@@ -114,6 +114,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/runs/{run_id}/kill", s.handleKillRun)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("GET /v1/stats", s.handleStats)
+	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	return mux
 }
 
@@ -176,6 +178,54 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		// Provider-quota brokering admits that failed open (shared store unreachable).
 		"broker_scope_degraded": s.broker.Degraded(),
 	})
+}
+
+// requireAdmin gates the cross-tenant observability endpoints. When auth is
+// enabled the caller must present a valid ADMIN key (these endpoints expose every
+// tenant's spend/attribution, so a normal tenant key must not read them). When
+// auth is disabled (dev), access is open — the startup path already warns loudly
+// that auth is off. Returns true when the request may proceed.
+func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	client, err := s.guard.Admit(bearerToken(r))
+	if err != nil {
+		s.denied(w, nil, err)
+		return false
+	}
+	if client != nil && !client.Admin { // auth on + non-admin key
+		writeError(w, http.StatusForbidden, "permission_error", "admin key required for observability endpoints")
+		return false
+	}
+	return true // client!=nil&&Admin, or client==nil (auth disabled)
+}
+
+// handleStats returns the attribution + firewall-health snapshot the built-in
+// dashboard renders: grand totals, top spenders by client and by run, recent
+// activity, and the enforcement-point health counters.
+func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	snap := s.ledger.Snapshot(10)
+	fw := s.firewall.Stats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"total":                 snap.Total,
+		"top_users":             snap.TopUsers,
+		"top_runs":              snap.TopRuns,
+		"recent":                snap.Recent,
+		"firewall":              fw,
+		"broker_scope_degraded": s.broker.Degraded(),
+	})
+}
+
+// handleDashboard serves the self-contained built-in dashboard (no external
+// assets); it polls /v1/stats and renders the spend firewall's state.
+// handleDashboard serves the static dashboard SHELL (no tenant data — that lives
+// behind the admin-gated /v1/stats the page fetches), so it is intentionally
+// open, like a login page. The page prompts for an admin key and sends it as a
+// bearer on the data fetch.
+func (s *Server) handleDashboard(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(dashboardHTML)
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -271,7 +321,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	acct := accounting{
 		client: client, reservation: reservation, ticket: ticket,
-		requestID: requestID, start: start, primaryAlias: primary.Alias,
+		requestID: requestID, runID: runID, start: start, primaryAlias: primary.Alias,
 		estUSD: estUSD, estTokens: estTokens,
 	}
 	if req.Stream {
@@ -288,6 +338,7 @@ type accounting struct {
 	reservation  *controls.Reservation
 	ticket       *firewall.Ticket
 	requestID    string
+	runID        string
 	start        time.Time
 	primaryAlias string
 	estUSD       float64
@@ -362,7 +413,8 @@ func (s *Server) runCandidates(
 		r.lastErr = err
 		s.ledger.Record(ledger.Record{
 			RequestID: acct.requestID, Alias: d.Alias, Provider: d.Provider, Upstream: d.Upstream,
-			User: userName(acct.client, req), LatencyMS: time.Since(acct.start).Milliseconds(), Status: "error",
+			User: userName(acct.client, req), RunID: acct.runID,
+			LatencyMS: time.Since(acct.start).Milliseconds(), Status: "error",
 		})
 		if ctx.Err() != nil || !retryable(err) || !canFO {
 			break
@@ -418,7 +470,7 @@ func (s *Server) recordSuccess(req *openai.ChatCompletionRequest, acct accountin
 	acct.ticket.Settle(cost, inTok+outTok)
 	s.ledger.Record(ledger.Record{
 		RequestID: acct.requestID, Alias: used.Alias, Provider: used.Provider, Upstream: used.Upstream,
-		User: userName(acct.client, req), InputTokens: inTok, OutputTokens: outTok,
+		User: userName(acct.client, req), RunID: acct.runID, InputTokens: inTok, OutputTokens: outTok,
 		CacheReadTokens: cacheR, CacheWriteTokens: cacheW,
 		CostUSD: cost, LatencyMS: time.Since(acct.start).Milliseconds(), Status: status,
 	})
@@ -468,7 +520,7 @@ func (s *Server) serveStreaming(ctx context.Context, w http.ResponseWriter, req 
 			acct.ticket.Settle(acct.estUSD, acct.estTokens)
 			s.ledger.Record(ledger.Record{
 				RequestID: acct.requestID, Alias: acct.primaryAlias,
-				User: userName(acct.client, req), InputTokens: acct.estTokens,
+				User: userName(acct.client, req), RunID: acct.runID, InputTokens: acct.estTokens,
 				CostUSD: acct.estUSD, LatencyMS: time.Since(acct.start).Milliseconds(), Status: "aborted",
 			})
 			sw.finishError(r.lastErr)

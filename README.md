@@ -1,5 +1,9 @@
 # heave
 
+[![ci](https://github.com/somasays/heave/actions/workflows/ci.yml/badge.svg)](https://github.com/somasays/heave/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8)](go.mod)
+
 **A runtime spend & quota firewall for AI agents.** Self-hostable,
 OpenAI-compatible, single Go binary. It sits in front of your models and stops a
 runaway agent **before** the vendor is billed — hard, real-time, per-run.

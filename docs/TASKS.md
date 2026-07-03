@@ -203,9 +203,14 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   tests (injected flush) + integration tier (`make integration`, verified vs
   PG14). Reviews: ✅ Go (`docs/reviews/phase5-pgledger-go.md`, PASS-with-nits) ·
   ✅ security (`docs/reviews/phase5-pgledger-security.md`, FAIL→fixed).
+- ✅ **Durable query API + event-time** — the durable `ts` is stamped at enqueue
+  (event time); `pgledger.TopSpendSince` aggregates top clients/runs by cost over a
+  window; `GET /v1/spend?since=` (admin-gated, ≤90d) serves it, with a dashboard
+  "durable spend (24h)" panel. Reviews: ✅ Go · ✅ security
+  (`docs/reviews/phase5-ledger-query-{go,security}.md`, both PASS-with-nits→folded).
 - ⬜ Dashboard: near-limit runs, quota headroom (needs firewall/broker live scope
-  snapshots); spend-velocity panel. Durable-ledger retention/partitioning +
-  event-time column + query API over Postgres (today the sink is write-only).
+  snapshots); spend-velocity panel. Durable-ledger retention/partitioning
+  automation (today an operator responsibility).
 
 ## Carried-over deferred items (from Phase 0/1 reviews — still live)
 - ⬜ Per-client/route rejection + velocity counters on /metrics.

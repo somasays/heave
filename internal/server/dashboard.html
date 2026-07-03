@@ -55,6 +55,9 @@
     <section><h2>Top spend by client</h2><table><thead><tr><th>Client</th><th class="num">Reqs</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody id="users"></tbody></table></section>
     <section><h2>Top spend by run</h2><table><thead><tr><th>Run</th><th class="num">Reqs</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody id="runs"></tbody></table></section>
   </div>
+  <section id="histsec" style="margin-top:1.25rem;display:none"><h2>Durable spend · last 24h (top clients)</h2>
+    <table><thead><tr><th>Client</th><th class="num">Reqs</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead><tbody id="hist"></tbody></table>
+  </section>
   <section style="margin-top:1.25rem"><h2>Recent activity</h2>
     <table><thead><tr><th>Client</th><th>Run</th><th>Model</th><th>Provider</th><th class="num">Tokens</th><th class="num">Cost</th><th class="num">ms</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table>
   </section>
@@ -99,7 +102,18 @@ async function tick(){
     $('status').textContent='updated '+new Date().toLocaleTimeString();
   }catch(err){$('status').textContent='disconnected ('+err.message+')';}
 }
+async function histTick(){
+  try{
+    const r=await fetch('/v1/spend?since=24h',{cache:'no-store',headers:authHeaders()});
+    if(r.status===501){$('histsec').style.display='none';return;} // no durable ledger
+    if(!r.ok)return;
+    const d=await r.json();
+    $('histsec').style.display='';
+    rows($('hist'),d.top_users,u=>`<tr><td class="mono">${esc(u.name)}</td><td class="num">${num(u.requests)}</td><td class="num">${num(u.tokens)}</td><td class="num">${usd(u.cost_usd)}</td></tr>`,'no durable spend in window');
+  }catch(err){/* leave last state */}
+}
 tick();setInterval(tick,3000);
+histTick();setInterval(histTick,15000);
 </script>
 </body>
 </html>

@@ -76,4 +76,29 @@ func TestIntegrationDurablePersist(t *testing.T) {
 	if s.Dropped() != 0 {
 		t.Fatalf("no records should have dropped, got %d", s.Dropped())
 	}
+
+	// Durable read side: TopSpendSince aggregates from Postgres.
+	s2, err := New(ctx, url)
+	if err != nil {
+		t.Fatalf("reader New: %v", err)
+	}
+	defer func() { _ = s2.Close() }()
+	byClient, byRun, err := s2.TopSpendSince(ctx, time.Now().Add(-time.Hour), 10)
+	if err != nil {
+		t.Fatalf("TopSpendSince: %v", err)
+	}
+	if len(byClient) != 1 || byClient[0].Name != "team" || byClient[0].Requests != n {
+		t.Fatalf("durable by-client wrong: %+v", byClient)
+	}
+	if len(byRun) != 1 || byRun[0].Name != "r1" {
+		t.Fatalf("durable by-run wrong: %+v", byRun)
+	}
+	// The time filter excludes everything before the window.
+	future, _, err := s2.TopSpendSince(ctx, time.Now().Add(time.Hour), 10)
+	if err != nil {
+		t.Fatalf("TopSpendSince(future): %v", err)
+	}
+	if len(future) != 0 {
+		t.Fatalf("a future `since` must return nothing, got %+v", future)
+	}
 }

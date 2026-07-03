@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -725,5 +726,71 @@ func TestErrorRecordCarriesRunAttribution(t *testing.T) {
 	}
 	if len(stats.Recent) == 0 || stats.Recent[0].RunID != "run-err" || stats.Recent[0].Status != "error" {
 		t.Fatalf("error record must carry run attribution, got %+v", stats.Recent)
+	}
+}
+
+type fakeReader struct {
+	byClient, byRun []ledger.NamedStat
+	err             error
+}
+
+func (f *fakeReader) TopSpendSince(_ context.Context, _ time.Time, _ int) ([]ledger.NamedStat, []ledger.NamedStat, error) {
+	return f.byClient, f.byRun, f.err
+}
+
+func TestSpendEndpoint(t *testing.T) {
+	rtr := router.New([]router.ModelConfig{{Alias: "m", Provider: "fake", Upstream: "u", Price: router.Price{InputPerMTok: 1, OutputPerMTok: 5}}}, "m")
+	getSpend := func(h http.Handler, query string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/spend"+query, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+		return rr
+	}
+
+	// No durable reader configured → 501.
+	noReader := newTestServer(t, Deps{Router: rtr, Providers: map[string]provider.Provider{"fake": &fakeProvider{resp: &provider.Response{}}}},
+		Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
+	if rr := getSpend(noReader.Handler(), ""); rr.Code != http.StatusNotImplemented {
+		t.Fatalf("no durable ledger must be 501, got %d", rr.Code)
+	}
+
+	// With a reader (auth off → open) → 200 + durable aggregates.
+	fr := &fakeReader{
+		byClient: []ledger.NamedStat{{Name: "team-a", Stat: ledger.Stat{Requests: 2, CostUSD: 1.5}}},
+		byRun:    []ledger.NamedStat{}, // real pgledger returns non-nil empty (shape parity)
+	}
+	srv := newTestServer(t, Deps{
+		Router: rtr, Providers: map[string]provider.Provider{"fake": &fakeProvider{resp: &provider.Response{}}}, LedgerReader: fr,
+	}, Options{MaxRequestBytes: 1 << 20, RequestTimeout: time.Second})
+	h := srv.Handler()
+	rr := getSpend(h, "?since=48h")
+	if rr.Code != 200 {
+		t.Fatalf("spend endpoint want 200, got %d %s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		TopUsers []ledger.NamedStat `json:"top_users"`
+		TopRuns  []ledger.NamedStat `json:"top_runs"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.TopUsers) != 1 || body.TopUsers[0].Name != "team-a" || body.TopUsers[0].CostUSD != 1.5 {
+		t.Fatalf("durable top_users wrong: %+v", body.TopUsers)
+	}
+	if body.TopRuns == nil {
+		t.Fatal("top_runs must marshal [] not null (shape parity with /v1/stats)")
+	}
+	// Bad since → 400.
+	if rr := getSpend(h, "?since=bogus"); rr.Code != http.StatusBadRequest {
+		t.Fatalf("invalid since must be 400, got %d", rr.Code)
+	}
+	// Over-wide window → 400 (bounds the aggregate scan).
+	if rr := getSpend(h, "?since=9000h"); rr.Code != http.StatusBadRequest {
+		t.Fatalf("since > 90d must be 400, got %d", rr.Code)
+	}
+	// A reader error → 502.
+	fr.err = errors.New("db down")
+	if rr := getSpend(h, ""); rr.Code != http.StatusBadGateway {
+		t.Fatalf("a query error must be 502, got %d", rr.Code)
 	}
 }

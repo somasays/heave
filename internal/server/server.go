@@ -40,22 +40,31 @@ type Server struct {
 	redactor       *redact.Redactor
 	firewall       *firewall.Firewall
 	broker         *broker.Broker
+	ledgerReader   LedgerReader
 	log            *slog.Logger
 	maxRequestBody int64
 	requestTimeout time.Duration
 }
 
+// LedgerReader is the optional durable-ledger read side (implemented by
+// pgledger.Store) powering the historical /v1/spend endpoint. nil when no durable
+// ledger is configured — the in-memory Snapshot only keeps a recent ring.
+type LedgerReader interface {
+	TopSpendSince(ctx context.Context, since time.Time, n int) (byClient, byRun []ledger.NamedStat, err error)
+}
+
 // Deps bundles the collaborators the server orchestrates.
 type Deps struct {
-	Router    *router.Router
-	Providers map[string]provider.Provider
-	Ledger    *ledger.Ledger
-	Guard     *controls.Guard
-	Health    *health.Tracker
-	Redactor  *redact.Redactor
-	Firewall  *firewall.Firewall
-	Broker    *broker.Broker
-	Log       *slog.Logger
+	Router       *router.Router
+	Providers    map[string]provider.Provider
+	Ledger       *ledger.Ledger
+	Guard        *controls.Guard
+	Health       *health.Tracker
+	Redactor     *redact.Redactor
+	Firewall     *firewall.Firewall
+	Broker       *broker.Broker
+	LedgerReader LedgerReader
+	Log          *slog.Logger
 }
 
 // Options configures request hardening limits.
@@ -101,6 +110,7 @@ func New(d Deps, opts Options) *Server {
 		redactor:       d.Redactor,
 		firewall:       d.Firewall,
 		broker:         d.Broker,
+		ledgerReader:   d.LedgerReader,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
 		requestTimeout: opts.RequestTimeout,
@@ -115,6 +125,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
+	mux.HandleFunc("GET /v1/spend", s.handleSpend)
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	return mux
 }
@@ -223,6 +234,46 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // handleDashboard serves the self-contained built-in dashboard (no external
 // assets); it polls /v1/stats and renders the spend firewall's state.
+// handleSpend serves DURABLE historical spend (top clients + runs by cost) from
+// the Postgres ledger over a time window (?since=24h, a Go duration). Admin-gated;
+// 501 when no durable ledger is configured (the in-memory /v1/stats keeps only a
+// recent ring).
+func (s *Server) handleSpend(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdmin(w, r) {
+		return
+	}
+	if s.ledgerReader == nil {
+		writeError(w, http.StatusNotImplemented, "not_configured",
+			"durable ledger is not enabled; historical spend is unavailable (see /v1/stats for recent activity)")
+		return
+	}
+	const maxWindow = 90 * 24 * time.Hour // bound the aggregate scan even for an admin
+	window := 24 * time.Hour
+	if v := r.URL.Query().Get("since"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 || d > maxWindow {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "since must be a positive Go duration ≤ 90 days, e.g. 24h")
+			return
+		}
+		window = d
+	}
+	since := time.Now().Add(-window)
+	// Bound the durable query so a slow aggregate can't pin a pool connection.
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	byClient, byRun, err := s.ledgerReader.TopSpendSince(ctx, since, 20)
+	if err != nil {
+		s.log.Error("durable spend query failed", "err", err)
+		writeError(w, http.StatusBadGateway, "api_error", "durable spend query failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"since":     since,
+		"top_users": byClient,
+		"top_runs":  byRun,
+	})
+}
+
 // handleDashboard serves the static dashboard SHELL (no tenant data — that lives
 // behind the admin-gated /v1/stats the page fetches), so it is intentionally
 // open, like a login page. The page prompts for an admin key and sends it as a

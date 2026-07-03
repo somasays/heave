@@ -59,11 +59,19 @@ CREATE TABLE IF NOT EXISTS spend (
 CREATE INDEX IF NOT EXISTS spend_client_ts ON spend (client, ts);
 CREATE INDEX IF NOT EXISTS spend_run_ts    ON spend (run_id, ts);`
 
+// entry is a record plus the EVENT time it was enqueued (which is ~request time,
+// not the later flush time), so the durable `ts` reflects when spend happened.
+type entry struct {
+	rec ledger.Record
+	ts  time.Time
+}
+
 // Store is an async, bounded, batching durable sink. Implements ledger.Sink.
 type Store struct {
-	ch      chan ledger.Record
-	flush   func([]ledger.Record) error
+	ch      chan entry
+	flush   func([]entry) error
 	dropped atomic.Uint64
+	now     func() time.Time
 	quit    chan struct{}
 	done    chan struct{}
 	closed  atomic.Bool // set by Close so Write stops sending (never send on a
@@ -95,10 +103,11 @@ func New(ctx context.Context, url string) (*Store, error) {
 
 // newStore builds the writer core with an injected flush (unit-testable). The
 // caller starts loop() with its chosen batch size and flush interval.
-func newStore(flush func([]ledger.Record) error, buffer int) *Store {
+func newStore(flush func([]entry) error, buffer int) *Store {
 	return &Store{
-		ch:    make(chan ledger.Record, buffer),
+		ch:    make(chan entry, buffer),
 		flush: flush,
+		now:   time.Now,
 		quit:  make(chan struct{}),
 		done:  make(chan struct{}),
 	}
@@ -113,7 +122,7 @@ func (s *Store) Write(r ledger.Record) {
 		return
 	}
 	select {
-	case s.ch <- r:
+	case s.ch <- entry{rec: r, ts: s.now()}: // stamp event time at enqueue
 	default:
 		s.dropped.Add(1)
 	}
@@ -127,9 +136,9 @@ func (s *Store) Dropped() uint64 { return s.dropped.Load() }
 func (s *Store) loop(batchN int, each time.Duration) {
 	t := time.NewTicker(each)
 	defer t.Stop()
-	batch := make([]ledger.Record, 0, batchN)
+	batch := make([]entry, 0, batchN)
 	// flush MUST be synchronous and must not retain the batch slice: doFlush reuses
-	// the backing array (batch[:0]) after it returns. Safe today — Record is all
+	// the backing array (batch[:0]) after it returns. Safe today — entry is all
 	// scalar (no aliasing) and writeBatch copies into COPY rows before returning.
 	doFlush := func() {
 		if len(batch) == 0 {
@@ -209,22 +218,23 @@ func cleanText(s string) string {
 }
 
 // writeBatch bulk-inserts a batch via COPY. Used by the Postgres constructor.
-func (s *Store) writeBatch(batch []ledger.Record) error {
+func (s *Store) writeBatch(batch []entry) error {
 	columns := []string{
-		"request_id", "alias", "provider", "upstream", "client", "run_id",
+		"ts", "request_id", "alias", "provider", "upstream", "client", "run_id",
 		"input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
 		"cost_usd", "latency_ms", "status",
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), writeTimeout)
 	defer cancel()
 	rows := make([][]any, len(batch))
-	for i, r := range batch {
+	for i, e := range batch {
+		r := e.rec
 		// Strip NUL bytes: Postgres TEXT rejects 0x00, and `user` is client-
 		// controlled and not charset-validated — one crafted request would
-		// otherwise fail (and drop) the whole 256-record batch. cleanText is a
-		// no-op for the common (NUL-free) case.
+		// otherwise fail (and drop) the whole batch. cleanText is a no-op for the
+		// common (NUL-free) case.
 		rows[i] = []any{
-			cleanText(r.RequestID), cleanText(r.Alias), cleanText(r.Provider), cleanText(r.Upstream),
+			e.ts, cleanText(r.RequestID), cleanText(r.Alias), cleanText(r.Provider), cleanText(r.Upstream),
 			cleanText(r.User), cleanText(r.RunID),
 			r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheWriteTokens,
 			r.CostUSD, r.LatencyMS, cleanText(r.Status),
@@ -234,4 +244,40 @@ func (s *Store) writeBatch(batch []ledger.Record) error {
 		return fmt.Errorf("pgledger copy: %w", err)
 	}
 	return nil
+}
+
+// TopSpendSince returns the top-n clients and runs by cost over records since
+// `since`, read from the durable store (the historical view the /v1/spend
+// endpoint serves — the in-memory ledger only keeps a recent ring).
+func (s *Store) TopSpendSince(ctx context.Context, since time.Time, n int) (byClient, byRun []ledger.NamedStat, err error) {
+	byClient, err = s.topBy(ctx, "client", since, n)
+	if err != nil {
+		return nil, nil, err
+	}
+	byRun, err = s.topBy(ctx, "run_id", since, n)
+	if err != nil {
+		return nil, nil, err
+	}
+	return byClient, byRun, nil
+}
+
+func (s *Store) topBy(ctx context.Context, dimension string, since time.Time, n int) ([]ledger.NamedStat, error) {
+	// dimension is a fixed internal string ("client"|"run_id"), never user input —
+	// no injection surface. %s is safe here.
+	q := fmt.Sprintf(`SELECT COALESCE(%s,''), count(*), COALESCE(sum(input_tokens+output_tokens+cache_read_tokens+cache_write_tokens),0), COALESCE(sum(cost_usd),0)
+		FROM spend WHERE ts >= $1 AND %s <> '' GROUP BY %s ORDER BY sum(cost_usd) DESC LIMIT $2`, dimension, dimension, dimension)
+	rows, err := s.pool.Query(ctx, q, since, n)
+	if err != nil {
+		return nil, fmt.Errorf("pgledger query %s: %w", dimension, err)
+	}
+	defer rows.Close()
+	out := make([]ledger.NamedStat, 0) // non-nil so an empty result marshals [] (like /v1/stats), not null
+	for rows.Next() {
+		var ns ledger.NamedStat
+		if err := rows.Scan(&ns.Name, &ns.Requests, &ns.Tokens, &ns.CostUSD); err != nil {
+			return nil, fmt.Errorf("pgledger scan %s: %w", dimension, err)
+		}
+		out = append(out, ns)
+	}
+	return out, rows.Err()
 }

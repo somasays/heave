@@ -66,6 +66,7 @@ func run(configPath string, log *slog.Logger) error {
 	}
 	rtr := router.New(models, cfg.Routing.DefaultModel)
 	led := ledger.New(log)
+	var ledgerReader server.LedgerReader
 	if cfg.Ledger.DatabaseURLEnv != "" {
 		dbURL := os.Getenv(cfg.Ledger.DatabaseURLEnv)
 		if dbURL == "" {
@@ -86,6 +87,7 @@ func run(configPath string, log *slog.Logger) error {
 			}
 			defer func() { _ = sink.Close() }()
 			led.WithSink(sink)
+			ledgerReader = sink // the sink also serves durable reads (/v1/spend)
 			log.Info("durable spend ledger enabled (postgres)")
 		}
 	}
@@ -176,7 +178,8 @@ func run(configPath string, log *slog.Logger) error {
 
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
-		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb, Log: log,
+		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb,
+		LedgerReader: ledgerReader, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,

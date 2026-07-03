@@ -12,10 +12,10 @@ import (
 // recorder is a flush target that captures batches.
 type recorder struct {
 	mu  sync.Mutex
-	got []ledger.Record
+	got []entry
 }
 
-func (r *recorder) flush(b []ledger.Record) error {
+func (r *recorder) flush(b []entry) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.got = append(r.got, b...)
@@ -44,7 +44,7 @@ func TestBatchesAndFlushesOnClose(t *testing.T) {
 
 func TestFlushesOnFullBatch(t *testing.T) {
 	flushed := make(chan int, 8)
-	s := newStore(func(b []ledger.Record) error { flushed <- len(b); return nil }, 100)
+	s := newStore(func(b []entry) error { flushed <- len(b); return nil }, 100)
 	go s.loop(3, time.Hour)
 	for i := 0; i < 3; i++ {
 		s.Write(ledger.Record{})
@@ -63,7 +63,7 @@ func TestFlushesOnFullBatch(t *testing.T) {
 func TestDropsWhenBufferFull(t *testing.T) {
 	entered := make(chan struct{}, 8)
 	block := make(chan struct{})
-	s := newStore(func(b []ledger.Record) error { entered <- struct{}{}; <-block; return nil }, 2)
+	s := newStore(func(b []entry) error { entered <- struct{}{}; <-block; return nil }, 2)
 	go s.loop(1, time.Hour)
 
 	s.Write(ledger.Record{RequestID: "a"}) // consumed → flush blocks
@@ -81,7 +81,7 @@ func TestDropsWhenBufferFull(t *testing.T) {
 
 func TestTickerFlushesPartialBatch(t *testing.T) {
 	flushed := make(chan int, 4)
-	s := newStore(func(b []ledger.Record) error { flushed <- len(b); return nil }, 100)
+	s := newStore(func(b []entry) error { flushed <- len(b); return nil }, 100)
 	go s.loop(100, 20*time.Millisecond) // batch too big to fill: only the ticker flushes
 	s.Write(ledger.Record{})
 	select {
@@ -96,7 +96,7 @@ func TestTickerFlushesPartialBatch(t *testing.T) {
 }
 
 func TestFailedFlushIsCounted(t *testing.T) {
-	s := newStore(func(b []ledger.Record) error { return errors.New("db down") }, 100)
+	s := newStore(func(b []entry) error { return errors.New("db down") }, 100)
 	go s.loop(2, time.Hour)
 	s.Write(ledger.Record{})
 	s.Write(ledger.Record{}) // full batch → flush → error
@@ -144,4 +144,19 @@ func TestConcurrentWriteAndClose(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	_ = s.Close()
 	wg.Wait()
+}
+
+func TestWriteStampsEnqueueTime(t *testing.T) {
+	rec := &recorder{}
+	s := newStore(rec.flush, 100)
+	fixed := time.Unix(1_700_000_000, 0)
+	s.now = func() time.Time { return fixed }
+	go s.loop(10, time.Hour)
+	s.Write(ledger.Record{RequestID: "a"})
+	_ = s.Close()
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.got) != 1 || !rec.got[0].ts.Equal(fixed) {
+		t.Fatalf("durable ts must be the enqueue (event) time, got %+v", rec.got)
+	}
 }

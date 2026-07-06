@@ -721,3 +721,171 @@ func TestVelocityRejectDoesNotChargeRunBudget(t *testing.T) {
 	}
 	tk3.Release()
 }
+
+// --- EnterChain: per-scope caps across a resolved policy chain (ADR 0006) ---
+
+// chain builds an org▸team▸app▸run chain with the given per-node caps. Distinct
+// keys per scope so each has its own window/counter.
+func chain(org, team, app, run Limits) []Scope {
+	return []Scope{
+		{Name: "org", Key: "org:acme", Limits: org},
+		{Name: "team", Key: "team:eng", Limits: team},
+		{Name: "app", Key: "app:bot", Limits: app},
+		{Name: "run", Key: "run:app:bot\x00r1", Limits: run},
+	}
+}
+
+func TestEnterChainVelocityBindsAtTightestScope(t *testing.T) {
+	f := New(true, Limits{}, nil) // no global limits: caps come from the chain
+	// The org caps $1/min; the app is loose ($100/min). A request that fits the
+	// app must still be denied by the tighter ORG cap, and name it.
+	c := chain(Limits{MaxUSDPerMin: 1.0}, Limits{}, Limits{MaxUSDPerMin: 100}, Limits{})
+	tk, err := f.EnterChain(c, "h", 0.9, 0)
+	if err != nil {
+		t.Fatalf("0.9 must fit under the $1 org cap, got %v", err)
+	}
+	tk.Settle(0.9, 0)
+	tk.Release()
+	var ve *VelocityError
+	_, err = f.EnterChain(c, "h", 0.2, 0) // 0.9 + 0.2 > 1.0 at the org
+	if !errors.As(err, &ve) {
+		t.Fatalf("want VelocityError, got %v", err)
+	}
+	if ve.Scope != "org" {
+		t.Fatalf("the binding node must be the org, got %q", ve.Scope)
+	}
+}
+
+func TestEnterChainConcurrencyBindsAtScope(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	// The team allows only one in-flight; the app is unbounded. A second
+	// concurrent request must be denied by the TEAM scope.
+	c := chain(Limits{}, Limits{MaxConcurrent: 1}, Limits{MaxConcurrent: 100}, Limits{})
+	t1, err := f.EnterChain(c, "h", 0, 0)
+	if err != nil {
+		t.Fatalf("first must admit, got %v", err)
+	}
+	var ce *ConcurrencyError
+	if _, err := f.EnterChain(c, "h", 0, 0); !errors.As(err, &ce) {
+		t.Fatalf("second concurrent must be denied, got %v", err)
+	} else if ce.Scope != "team" {
+		t.Fatalf("binding node must be the team, got %q", ce.Scope)
+	}
+	t1.Release() // free the hold
+	if t2, err := f.EnterChain(c, "h", 0, 0); err != nil {
+		t.Fatalf("after release the slot must free, got %v", err)
+	} else {
+		t2.Release()
+	}
+}
+
+func TestEnterChainPerRunBudgetKillsRun(t *testing.T) {
+	f := New(true, Limits{LoopThreshold: 0}, nil)
+	// Only the run scope carries a per-run $ cap (as policy resolves the tightest
+	// ancestor value onto the run). Exceeding it auto-kills the run.
+	c := chain(Limits{}, Limits{}, Limits{}, Limits{MaxUSDPerRun: 0.01})
+	tk, err := f.EnterChain(c, "", 0.006, 0)
+	if err != nil {
+		t.Fatalf("first under-budget call must admit, got %v", err)
+	}
+	tk.Settle(0.006, 0)
+	tk.Release()
+	if _, err := f.EnterChain(c, "", 0.006, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("exceeding the per-run cap must kill the run, got %v", err)
+	}
+	// The run stays killed for subsequent calls.
+	if _, err := f.EnterChain(c, "", 0.001, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("a killed run stays dead, got %v", err)
+	}
+}
+
+func TestEnterChainSettleReconcilesEveryScope(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	// The org caps $1/min. Reserve 0.9 but settle to a real 0.1 — the org window
+	// must reflect the actual, so a following 0.85 fits.
+	c := chain(Limits{MaxUSDPerMin: 1.0}, Limits{}, Limits{}, Limits{})
+	tk, err := f.EnterChain(c, "h", 0.9, 0)
+	if err != nil {
+		t.Fatalf("0.9 must admit, got %v", err)
+	}
+	tk.Settle(0.1, 0) // actual far below the estimate
+	tk.Release()
+	tk2, err := f.EnterChain(c, "h", 0.85, 0) // 0.1 + 0.85 < 1.0
+	if err != nil {
+		t.Fatalf("settle must have reconciled the org window down; got %v", err)
+	}
+	tk2.Release()
+}
+
+func TestEnterChainDisabledAdmitsAll(t *testing.T) {
+	f := New(false, Limits{}, nil)
+	c := chain(Limits{MaxUSDPerMin: 0.01}, Limits{}, Limits{}, Limits{MaxUSDPerRun: 0.01})
+	tk, err := f.EnterChain(c, "h", 100, 100)
+	if err != nil {
+		t.Fatalf("disabled firewall must admit any chain, got %v", err)
+	}
+	tk.Release()
+}
+
+func TestEnterChainKillIsAddressableByRunKey(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	c := chain(Limits{}, Limits{}, Limits{}, Limits{})
+	runKey := c[3].Key // the "run" scope's Key — what EnterChain enforces kill under
+	tk, err := f.EnterChain(c, "h", 0, 0)
+	if err != nil {
+		t.Fatalf("first must admit, got %v", err)
+	}
+	tk.Release()
+	// Killing via the run scope key (as the server will, from the resolved chain)
+	// must actually stop the run — the regression the review caught (Kill/EnterChain
+	// keyed off different strings).
+	if err := f.KillRun(runKey); err != nil {
+		t.Fatalf("KillRun must not error, got %v", err)
+	}
+	if !f.RunKilled(runKey) {
+		t.Fatal("RunKilled must see the kill")
+	}
+	if _, err := f.EnterChain(c, "h", 0, 0); !errors.Is(err, ErrKilled) {
+		t.Fatalf("a run killed by its scope key must be rejected on re-entry, got %v", err)
+	}
+}
+
+func TestEnterChainFailsClosedOnMalformedChain(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	// Empty-keyed scope: would collide distinct runs on a "" counter and disable
+	// kill/budget — must fail closed, not admit.
+	bad := []Scope{{Name: "org", Key: "", Limits: Limits{}}}
+	if _, err := f.EnterChain(bad, "h", 0, 0); !errors.Is(err, ErrBadChain) {
+		t.Fatalf("empty-keyed scope must be rejected, got %v", err)
+	}
+	// Two "run" scopes: ambiguous which drives kill/budget — reject.
+	twoRuns := []Scope{
+		{Name: "run", Key: "run:a\x001", Limits: Limits{}},
+		{Name: "run", Key: "run:a\x002", Limits: Limits{}},
+	}
+	if _, err := f.EnterChain(twoRuns, "h", 0, 0); !errors.Is(err, ErrBadChain) {
+		t.Fatalf("multiple run scopes must be rejected, got %v", err)
+	}
+}
+
+func TestEnterChainNegativeEstimateCannotDeflateCounter(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	c := chain(Limits{MaxUSDPerMin: 1.0}, Limits{}, Limits{}, Limits{})
+	t1, err := f.EnterChain(c, "h", 0.9, 0) // hold 0.9 in the org window
+	if err != nil {
+		t.Fatalf("0.9 must admit, got %v", err)
+	}
+	// A negative estimate must NOT subtract from the live 0.9 (that would be spend
+	// evasion). Clamped to 0, so the window stays at 0.9.
+	neg, err := f.EnterChain(c, "h", -0.5, 0)
+	if err != nil {
+		t.Fatalf("a zero-clamped estimate still admits, got %v", err)
+	}
+	neg.Release()
+	// If the negative had deflated the counter to 0.4, this 0.2 would pass; with the
+	// clamp it must be denied (0.9 + 0.2 > 1.0).
+	if _, err := f.EnterChain(c, "h", 0.2, 0); !errors.As(err, new(*VelocityError)) {
+		t.Fatalf("negative estimate must not have deflated the org counter, got %v", err)
+	}
+	t1.Release()
+}

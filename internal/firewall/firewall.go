@@ -57,6 +57,17 @@ const (
 // ErrKilled means the run has been killed (manually or by loop detection).
 var ErrKilled = errors.New("run killed")
 
+// ErrBadChain means an EnterChain chain is malformed: a scope with an empty Key,
+// an over-long Key, or more than one scope named "run". The firewall fails CLOSED
+// on these rather than silently enforce a chain where kill/budget bind to the
+// wrong (or no) run key, or where distinct runs collide on one empty counter key.
+var ErrBadChain = errors.New("invalid scope chain")
+
+// maxScopeKeyLen bounds a caller-supplied scope key so a direct EnterChain caller
+// cannot spray or oversize the reserve keyspace. Policy ids are ≤128 chars and a
+// run key is ~"run:app:<128>\x00<128>", well under this.
+const maxScopeKeyLen = 512
+
 // ErrKillStoreFull means the local kill map is at capacity with live kills, so a
 // new kill could not be recorded without evicting a live one. It surfaces so the
 // caller reports failure (and can retry) rather than silently under-enforcing.
@@ -104,6 +115,22 @@ type Limits struct {
 	MaxUSDPerRun float64
 	// KillTTL bounds how long a kill is remembered (local + shared). 0 = default.
 	KillTTL time.Duration
+}
+
+// Scope is one enforceable level of a request's chain: a stable reserve-store /
+// map key plus THAT level's own caps. EnterChain enforces velocity + concurrency
+// independently per scope (all-or-nothing across the chain) and the per-run $
+// budget on the scope named "run". It mirrors policy.Scope; the server translates
+// a resolved policy chain into these so the firewall stays pure (it never imports
+// policy). Loop detection and kill remain run-scoped and use the run scope's Key.
+type Scope struct {
+	Name string // "org" | "team" | "app" | "run" | "key"
+	// Key is the stable reserve-store / in-memory counter key. The firewall trusts
+	// it VERBATIM (it is also the kill key for a "run" scope), so the caller MUST
+	// supply non-empty, delimiter-safe, type-namespaced, cross-tenant-unique keys —
+	// policy's validated keys ("org:<id>", "run:<owner>\x00<id>", …) satisfy this.
+	Key    string
+	Limits Limits // this level's own caps (only the velocity/concurrency/run fields apply)
 }
 
 // Firewall enforces Limits across keys and runs.
@@ -379,17 +406,84 @@ type Ticket struct {
 	settled   bool
 }
 
-// Enter is the pre-vendor gate: kill/loop checks, then a velocity + concurrency
-// check-and-RESERVE for the key and run scopes (both under one lock, so
-// concurrent callers see each other's holds). key is the authenticated client
-// (may be ""); runID is the agent run (may be "" → run scope skipped); est* is
-// the request's upper-bound cost/token estimate, held until Settle.
+// Enter is the pre-vendor gate for the built-in {key, run} scopes, both enforced
+// against the firewall's single configured Limits. key is the authenticated
+// client (may be ""); runID is the agent run (may be "" → run scope skipped);
+// est* is the request's upper-bound cost/token estimate, held until Settle. It is
+// a thin wrapper over EnterChain: it builds the two-scope chain and delegates.
 func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estTokens int) (*Ticket, error) {
 	if !f.enabled {
 		return &Ticket{}, nil
 	}
+	var scopes []Scope
+	if key != "" {
+		scopes = append(scopes, Scope{Name: "key", Key: "key:" + key, Limits: f.limits})
+	}
 	runKey := f.runKey(key, runID)
+	if runKey != "" {
+		scopes = append(scopes, Scope{Name: "run", Key: runKey, Limits: f.limits})
+	}
+	return f.enterChain(scopes, runKey, promptHash, f.limits.MaxUSDPerRun, estUSD, estTokens)
+}
 
+// EnterChain is the pre-vendor gate for a RESOLVED policy chain: an ordered set of
+// scopes (org▸team▸app▸run), each carrying its OWN caps. Velocity + concurrency
+// are enforced independently per scope (all-or-nothing across the chain); the
+// per-run $ budget, loop detection, and kill are enforced on the scope named
+// "run" (its Key is the run's unique kill/budget key). This is the generalization
+// of Enter from one global Limits to per-scope caps (docs/adr/0006); Enter is the
+// two-scope special case.
+//
+// Preconditions the caller (the server, translating a policy.Chain) MUST honor —
+// the firewall trusts the keys verbatim and cannot re-derive them:
+//   - Every scope Key is non-empty, ≤maxScopeKeyLen, delimiter-safe, and
+//     collision-free across tenants (policy's validated, type-namespaced keys
+//     satisfy this). A violation returns ErrBadChain — fail closed.
+//   - At most ONE scope is named "run" (else ErrBadChain). A chain may have no run
+//     scope (no run id); then run-level budget/loop/kill simply don't apply.
+//   - To later KILL a run entered here, call KillRun with the SAME run scope Key
+//     (not Kill(ownerKey,runID), which derives a different key).
+//   - NODE-level kills (policy Chain.KilledBy for a killed org/team/app) are NOT
+//     visible to the firewall; the caller must deny those BEFORE calling here.
+//   - Loop detection uses the firewall's global LoopThreshold (not a per-scope
+//     value); it is inert if the firewall was built with LoopThreshold == 0.
+func (f *Firewall) EnterChain(scopes []Scope, promptHash string, estUSD float64, estTokens int) (*Ticket, error) {
+	if !f.enabled {
+		return &Ticket{}, nil
+	}
+	var runKey string
+	var runMaxUSD float64
+	runScopes := 0
+	for _, sc := range scopes {
+		if sc.Key == "" || len(sc.Key) > maxScopeKeyLen {
+			return nil, ErrBadChain // fail closed: empty/oversized keys collide or spray
+		}
+		if sc.Name == "run" {
+			runScopes++
+			runKey = sc.Key
+			runMaxUSD = sc.Limits.MaxUSDPerRun
+		}
+	}
+	if runScopes > 1 {
+		return nil, ErrBadChain // ambiguous: which run drives kill/budget?
+	}
+	return f.enterChain(scopes, runKey, promptHash, runMaxUSD, estUSD, estTokens)
+}
+
+// enterChain is the shared admit core: kill check, then per-scope velocity +
+// concurrency reserve plus the per-run budget. runKey is the run's kill/budget key
+// ("" if the chain has no run scope); runMaxUSD is the per-run $ cap to enforce on
+// it. Assumes f.enabled.
+func (f *Firewall) enterChain(scopes []Scope, runKey, promptHash string, runMaxUSD, estUSD float64, estTokens int) (*Ticket, error) {
+	// A negative estimate must never DEFLATE a counter (a buggy/hostile caller
+	// could otherwise reserve "negative spend" and under-enforce). Floor at 0; the
+	// real spend is reconciled at Settle.
+	if estUSD < 0 {
+		estUSD = 0
+	}
+	if estTokens < 0 {
+		estTokens = 0
+	}
 	// Kill check is OUTSIDE f.mu: the store may do network I/O (Redis), which
 	// must never be held under the global firewall lock.
 	if f.isKilled(runKey) {
@@ -399,10 +493,10 @@ func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estToken
 	// Shared mode: velocity + concurrency go to the cross-replica store; loop
 	// detection and the per-run $ budget stay local.
 	if f.scopeStore != nil {
-		return f.enterShared(key, runID, runKey, promptHash, estUSD, estTokens)
+		return f.enterShared(scopes, runKey, promptHash, runMaxUSD, estUSD, estTokens)
 	}
 
-	ticket, tripped, err := f.enterLocked(key, runID, runKey, promptHash, estUSD, estTokens)
+	ticket, tripped, err := f.enterLocked(scopes, runKey, promptHash, runMaxUSD, estUSD, estTokens)
 	if tripped {
 		// An auto-kill trip (loop detection OR per-run budget): kill the run
 		// (local + shared) outside the lock, since the shared store may do network
@@ -420,17 +514,17 @@ func (f *Firewall) Enter(key, runID, promptHash string, estUSD float64, estToken
 // enterLocked runs the check-and-reserve under f.mu. It returns tripped=true
 // (with a nil ticket) when loop detection fires, so the caller can issue the
 // kill after unlocking. The defer keeps the lock panic-safe.
-func (f *Firewall) enterLocked(key, runID, runKey, promptHash string, estUSD float64, estTokens int) (tk *Ticket, tripped bool, err error) {
+func (f *Firewall) enterLocked(scopes []Scope, runKey, promptHash string, runMaxUSD, estUSD float64, estTokens int) (tk *Ticket, tripped bool, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := f.now()
 	f.gcLocked(now)
 
-	tripped, budgetKey := f.checkLoopBudgetLocked(runKey, promptHash, estUSD, now)
+	tripped, budgetKey := f.checkLoopBudgetLocked(runKey, promptHash, estUSD, runMaxUSD, now)
 	if tripped {
 		return nil, true, nil
 	}
-	mapKeys, verr := f.checkReserveScopesLocked(f.scopeKeys(key, runID), estUSD, estTokens, now)
+	mapKeys, verr := f.checkReserveScopesLocked(toScopeKeys(scopes), estUSD, estTokens, now)
 	if verr != nil {
 		f.unreserveBudgetLocked(budgetKey, estUSD) // roll back the budget reserved above
 		return nil, false, verr
@@ -439,10 +533,11 @@ func (f *Firewall) enterLocked(key, runID, runKey, promptHash string, estUSD flo
 }
 
 // checkLoopBudgetLocked runs the LOCAL loop-detection + per-run-budget checks and,
-// if the budget applies, RESERVES the estimate against it. Returns tripped=true
-// when either fires (caller then kills), and the budget scope key (for reconcile/
-// rollback). Assumes f.mu is held.
-func (f *Firewall) checkLoopBudgetLocked(runKey, promptHash string, estUSD float64, now time.Time) (tripped bool, budgetKey string) {
+// if the budget applies, RESERVES the estimate against it. runMaxUSD is the run
+// scope's own per-run $ cap (the tightest ancestor value, pre-resolved). Returns
+// tripped=true when either fires (caller then kills), and the budget scope key
+// (for reconcile/rollback). Assumes f.mu is held.
+func (f *Firewall) checkLoopBudgetLocked(runKey, promptHash string, estUSD, runMaxUSD float64, now time.Time) (tripped bool, budgetKey string) {
 	if runKey != "" && f.limits.LoopThreshold > 0 && promptHash != "" &&
 		f.tripLoopLocked(runKey, promptHash, now) {
 		return true, ""
@@ -450,12 +545,12 @@ func (f *Firewall) checkLoopBudgetLocked(runKey, promptHash string, estUSD float
 	// Per-run cumulative budget: if this request would push the run over its hard
 	// $ cap, KILL the run (trip) — the backstop for runaways whose prompts keep
 	// changing, which loop detection cannot see.
-	if runKey != "" && f.limits.MaxUSDPerRun > 0 {
+	if runKey != "" && runMaxUSD > 0 {
 		spent := 0.0
 		if st := f.scopes[runKey]; st != nil {
 			spent = st.runUSD
 		}
-		if spent+estUSD > f.limits.MaxUSDPerRun {
+		if spent+estUSD > runMaxUSD {
 			return true, ""
 		}
 		st := f.ensureScopeLocked(runKey, now)
@@ -475,9 +570,9 @@ func (f *Firewall) checkReserveScopesLocked(keys []scopeKey, estUSD float64, est
 			return nil, verr
 		}
 	}
-	if f.limits.MaxConcurrent > 0 {
-		for _, sk := range keys {
-			if st := f.scopes[sk.mapKey]; st != nil && st.inflight >= f.limits.MaxConcurrent {
+	for _, sk := range keys {
+		if sk.limits.MaxConcurrent > 0 {
+			if st := f.scopes[sk.mapKey]; st != nil && st.inflight >= sk.limits.MaxConcurrent {
 				return nil, &ConcurrencyError{Scope: sk.name}
 			}
 		}
@@ -510,25 +605,17 @@ func (f *Firewall) unreserveBudgetLocked(budgetKey string, estUSD float64) {
 // check-and-reserve go to the shared store (one atomic op across replicas). On a
 // store denial the local budget reservation is rolled back so no partial state
 // leaks.
-func (f *Firewall) enterShared(key, runID, runKey, promptHash string, estUSD float64, estTokens int) (*Ticket, error) {
-	tripped, budgetKey := f.reserveLocalLocked(runKey, promptHash, estUSD)
+func (f *Firewall) enterShared(scopes []Scope, runKey, promptHash string, runMaxUSD, estUSD float64, estTokens int) (*Ticket, error) {
+	tripped, budgetKey := f.reserveLocalLocked(runKey, promptHash, runMaxUSD, estUSD)
 	if tripped {
 		_ = f.doKill(runKey)
 		return nil, ErrKilled
 	}
 
-	keys, names := f.storeScopes(key, runID)
+	keys, names, maxUSD, maxTok, maxConc := sharedCaps(scopes)
 	if len(keys) == 0 {
-		// No velocity/concurrency caps configured: only the (local) budget applies.
+		// No velocity/concurrency caps on any scope: only the (local) budget applies.
 		return &Ticket{fw: f, runScopeKey: budgetKey, estUSD: estUSD, estTokens: estTokens}, nil
-	}
-	maxUSD := make([]float64, len(keys))
-	maxTok := make([]int, len(keys))
-	maxConc := make([]int, len(keys))
-	for i := range keys {
-		maxUSD[i] = f.limits.MaxUSDPerMin
-		maxTok[i] = f.limits.MaxTokensPerMin
-		maxConc[i] = f.limits.MaxConcurrent
 	}
 	holdID := newHoldID()
 	admitted, dname, dkind, err := f.scopeStore.Reserve(keys, names, maxUSD, maxTok, maxConc, estUSD, estTokens, holdID)
@@ -539,7 +626,7 @@ func (f *Firewall) enterShared(key, runID, runKey, promptHash string, estUSD flo
 		// reconciles against LOCAL state (not the store), so it can't corrupt the
 		// shared window. Observable via Stats.ScopeDegraded.
 		f.scopeDegraded.Add(1)
-		return f.reserveScopesLocal(key, runID, budgetKey, estUSD, estTokens)
+		return f.reserveScopesLocal(scopes, budgetKey, estUSD, estTokens)
 	}
 	if !admitted {
 		f.releaseBudgetLocked(budgetKey, estUSD) // roll back the local budget reserve
@@ -558,23 +645,23 @@ func (f *Firewall) enterShared(key, runID, runKey, promptHash string, estUSD flo
 // budget) under f.mu. It returns tripped=true when either fires (the caller then
 // kills), and the run-scope key if a budget reservation was held (for rollback /
 // settle).
-func (f *Firewall) reserveLocalLocked(runKey, promptHash string, estUSD float64) (tripped bool, budgetKey string) {
+func (f *Firewall) reserveLocalLocked(runKey, promptHash string, runMaxUSD, estUSD float64) (tripped bool, budgetKey string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := f.now()
 	f.gcLocked(now)
-	return f.checkLoopBudgetLocked(runKey, promptHash, estUSD, now)
+	return f.checkLoopBudgetLocked(runKey, promptHash, estUSD, runMaxUSD, now)
 }
 
 // reserveScopesLocal is the shared-mode fallback when Redis is unreachable: it
 // runs the LOCAL velocity/concurrency check-and-reserve (loop + budget already
 // done by reserveLocalLocked) and returns a LOCAL-backed ticket. On a local cap
 // breach it rolls back the budget reservation.
-func (f *Firewall) reserveScopesLocal(key, runID, budgetKey string, estUSD float64, estTokens int) (*Ticket, error) {
+func (f *Firewall) reserveScopesLocal(scopes []Scope, budgetKey string, estUSD float64, estTokens int) (*Ticket, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	now := f.now()
-	mapKeys, err := f.checkReserveScopesLocked(f.scopeKeys(key, runID), estUSD, estTokens, now)
+	mapKeys, err := f.checkReserveScopesLocked(toScopeKeys(scopes), estUSD, estTokens, now)
 	if err != nil {
 		f.unreserveBudgetLocked(budgetKey, estUSD)
 		return nil, err
@@ -590,21 +677,21 @@ func (f *Firewall) releaseBudgetLocked(budgetKey string, estUSD float64) {
 	f.unreserveBudgetLocked(budgetKey, estUSD)
 }
 
-// storeScopes lists the (key, run) scopes to enforce in the shared store, with
-// their display names. Empty when no velocity/concurrency cap is configured.
-func (f *Firewall) storeScopes(key, runID string) (keys, names []string) {
-	if f.limits.MaxUSDPerMin <= 0 && f.limits.MaxTokensPerMin <= 0 && f.limits.MaxConcurrent <= 0 {
-		return nil, nil
+// sharedCaps flattens a chain into the parallel slices the ScopeStore expects,
+// INCLUDING only scopes that actually carry a velocity or concurrency cap (a
+// run scope carrying only MaxUSDPerRun is enforced locally, not in the store).
+func sharedCaps(scopes []Scope) (keys, names []string, maxUSD []float64, maxTok, maxConc []int) {
+	for _, sc := range scopes {
+		if sc.Limits.MaxUSDPerMin <= 0 && sc.Limits.MaxTokensPerMin <= 0 && sc.Limits.MaxConcurrent <= 0 {
+			continue
+		}
+		keys = append(keys, sc.Key)
+		names = append(names, sc.Name)
+		maxUSD = append(maxUSD, sc.Limits.MaxUSDPerMin)
+		maxTok = append(maxTok, sc.Limits.MaxTokensPerMin)
+		maxConc = append(maxConc, sc.Limits.MaxConcurrent)
 	}
-	if key != "" {
-		keys = append(keys, "key:"+key)
-		names = append(names, "key")
-	}
-	if runID != "" {
-		keys = append(keys, f.runKey(key, runID))
-		names = append(names, "run")
-	}
-	return keys, names
+	return keys, names, maxUSD, maxTok, maxConc
 }
 
 // Settle reconciles the held estimate to the actual spend (delta into the same
@@ -695,40 +782,56 @@ func (tk *Ticket) Release() {
 	}
 }
 
-// Kill hard-stops a run owned by ownerKey. A client can only kill its own runs.
-// The returned error is the shared store's write error (nil when there is no
-// shared store): a non-nil error means the kill is in effect on this replica but
-// may not have propagated to others, so the caller MUST surface it rather than
-// report success.
+// KillRun hard-stops the run identified by its EXACT run scope key — the same key
+// EnterChain enforced kill/budget under (for a policy chain, the "run" scope's
+// Key). This single-sources admit and kill: the manual kill path and the admit
+// path key off the same string, so a chain-entered run is actually killable.
+// runKey=="" is a no-op. The returned error is the shared store's write error
+// (nil when there is no shared store): a non-nil error means the kill is in effect
+// on this replica but may not have propagated, so the caller MUST surface it.
+func (f *Firewall) KillRun(runKey string) error {
+	if runKey == "" {
+		return nil
+	}
+	return f.doKill(runKey)
+}
+
+// RunKilled reports whether the run with this exact run scope key is killed.
+func (f *Firewall) RunKilled(runKey string) bool { return f.isKilled(runKey) }
+
+// Kill hard-stops a run owned by ownerKey, using the built-in Enter scoping. A
+// client can only kill its own runs. For a run entered via EnterChain, use KillRun
+// with the run scope's Key instead — this derivation is Enter-specific.
 func (f *Firewall) Kill(ownerKey, runID string) error {
 	if runID == "" {
 		return nil
 	}
-	return f.doKill(f.runKey(ownerKey, runID))
+	return f.KillRun(f.runKey(ownerKey, runID))
 }
 
-// Killed reports whether a run (owned by ownerKey) has been killed.
+// Killed reports whether a run (owned by ownerKey) has been killed. For a run
+// entered via EnterChain, use RunKilled with the run scope's Key instead.
 func (f *Firewall) Killed(ownerKey, runID string) bool {
 	if runID == "" {
 		return false
 	}
-	return f.isKilled(f.runKey(ownerKey, runID))
+	return f.RunKilled(f.runKey(ownerKey, runID))
 }
 
 type scopeKey struct {
-	name   string // "key" or "run"
+	name   string // "key" | "run" | "org" | "team" | "app"
 	mapKey string
+	limits Limits // this scope's own velocity/concurrency caps
 }
 
-func (f *Firewall) scopeKeys(key, runID string) []scopeKey {
-	var s []scopeKey
-	if key != "" {
-		s = append(s, scopeKey{"key", "key:" + key})
+// toScopeKeys projects a chain onto the internal (name, mapKey, limits) triples
+// the local velocity/concurrency reserve operates on.
+func toScopeKeys(scopes []Scope) []scopeKey {
+	sk := make([]scopeKey, len(scopes))
+	for i, sc := range scopes {
+		sk[i] = scopeKey{name: sc.Name, mapKey: sc.Key, limits: sc.Limits}
 	}
-	if runID != "" {
-		s = append(s, scopeKey{"run", f.runKey(key, runID)})
-	}
-	return s
+	return sk
 }
 
 // runKey namespaces a run by its owner so cross-tenant interference is impossible.
@@ -753,7 +856,7 @@ func (f *Firewall) ensureScopeLocked(mapKey string, now time.Time) *scopeState {
 }
 
 func (f *Firewall) checkVelocityLocked(sk scopeKey, estUSD float64, estTokens int, now time.Time) error {
-	if f.limits.MaxUSDPerMin <= 0 && f.limits.MaxTokensPerMin <= 0 {
+	if sk.limits.MaxUSDPerMin <= 0 && sk.limits.MaxTokensPerMin <= 0 {
 		return nil
 	}
 	st := f.scopes[sk.mapKey]
@@ -761,10 +864,10 @@ func (f *Firewall) checkVelocityLocked(sk scopeKey, estUSD float64, estTokens in
 		return nil
 	}
 	usd, toks := st.window.sum(now.Unix())
-	if f.limits.MaxUSDPerMin > 0 && usd+estUSD > f.limits.MaxUSDPerMin {
+	if sk.limits.MaxUSDPerMin > 0 && usd+estUSD > sk.limits.MaxUSDPerMin {
 		return &VelocityError{Scope: sk.name, RetryAfterSec: windowSeconds}
 	}
-	if f.limits.MaxTokensPerMin > 0 && toks+estTokens > f.limits.MaxTokensPerMin {
+	if sk.limits.MaxTokensPerMin > 0 && toks+estTokens > sk.limits.MaxTokensPerMin {
 		return &VelocityError{Scope: sk.name, RetryAfterSec: windowSeconds}
 	}
 	return nil

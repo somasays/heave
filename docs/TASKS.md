@@ -212,6 +212,38 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   snapshots); spend-velocity panel. Durable-ledger retention/partitioning
   automation (today an operator responsibility).
 
+## Phase 6 — Org control plane (hierarchical budgets) — IN PROGRESS, committed LOCALLY (not pushed: open-core boundary undecided)
+Specs: ADR 0004 (enforcement integration contract), 0005 (control-plane topology),
+0006 (hierarchical budgets & resolution). Umbrella model: a budget at any node
+caps aggregate spend at/under it; admit iff a request fits under every ancestor.
+- ✅ **6.1 policy model + resolver** (`internal/policy`) — org▸team▸app▸run,
+  budget at any node, `Resolve(keySHA,runID)→Chain` (org-first scopes + tightest
+  per-run cap). Fail-closed: negative caps rejected, ids/run-ids validated (no
+  `:`/NUL), broken/dangling ancestry → `ErrBrokenChain`. Reviews: ✅ Go · ✅
+  security (both PASS-with-nits → folded).
+- ✅ **6.2 firewall per-scope enforcement** (`internal/firewall.EnterChain`) —
+  generalized from one global Limits over {key,run} to per-scope caps over the
+  chain; `Enter` is now the 2-scope wrapper. `KillRun`/`RunKilled` single-source
+  the run key so a chain-entered run is killable; fail-closed on malformed chains;
+  negative-estimate clamp. Reviews: ✅ Go (PASS-nits) · ✅ security
+  (CHANGES-NEEDED→fixed: kill-key incompatibility, empty/dup run scope fail-open).
+- ✅ **6.3 enforcer adapter** (`internal/enforcer`) — binds policy↔firewall
+  (Translate + fail-closed Resolver: only unknown-key falls through, failures
+  deny). Review: ✅ combined (PASS-nits → folded: dangling-key fail-closed in
+  policy; calendar-budget runtime-gap doc).
+- ⬜ **6.4 live wiring (3b)** — server resolves the chain per request, denies on
+  `chain.KilledBy` (consume N1 + test it), calls `EnterChain`; kill endpoint uses
+  the run scope key; config `policy:` section (declarative hierarchy, Inv #6) +
+  cmd builds the store and injects the resolver (optional → nil = today's flat
+  behavior). Then the phase gate's dual review closes on the end-to-end path.
+- ⬜ **6.5 later** — calendar (Day/Month) enforcement tied to the durable ledger;
+  admin HTTP API (create team/app, set budget, issue key, node kill);
+  Postgres-backed policy store; deny responses naming the binding node.
+- ⬜ **Open decision** (blocks push): publish the control-plane code + ADRs
+  0004/0005/0006 in the public repo, or split into an enterprise repo (open-core).
+- ⬜ **Stale docs** to rewrite around the PDP/control-plane model: README "Where it
+  sits", `docs/DEPLOYMENT.md` (both still carry the rejected inline-proxy framing).
+
 ## Carried-over deferred items (from Phase 0/1 reviews — still live)
 - ⬜ Per-client/route rejection + velocity counters on /metrics.
 - ⬜ Key revocation/expiry + hot config reload; global rate/concurrency cap.

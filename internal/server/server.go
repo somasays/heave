@@ -25,6 +25,7 @@ import (
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/openai"
+	"github.com/somasays/heave/internal/policy"
 	"github.com/somasays/heave/internal/provider"
 	"github.com/somasays/heave/internal/redact"
 	"github.com/somasays/heave/internal/router"
@@ -40,6 +41,7 @@ type Server struct {
 	redactor       *redact.Redactor
 	firewall       *firewall.Firewall
 	broker         *broker.Broker
+	policy         *policy.Store // nil ⇒ control plane off (routes not mounted)
 	ledgerReader   LedgerReader
 	log            *slog.Logger
 	maxRequestBody int64
@@ -63,6 +65,7 @@ type Deps struct {
 	Redactor     *redact.Redactor
 	Firewall     *firewall.Firewall
 	Broker       *broker.Broker
+	Policy       *policy.Store // optional org control plane; nil ⇒ management API off
 	LedgerReader LedgerReader
 	Log          *slog.Logger
 }
@@ -110,6 +113,7 @@ func New(d Deps, opts Options) *Server {
 		redactor:       d.Redactor,
 		firewall:       d.Firewall,
 		broker:         d.Broker,
+		policy:         d.Policy,
 		ledgerReader:   d.LedgerReader,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
@@ -127,6 +131,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/stats", s.handleStats)
 	mux.HandleFunc("GET /v1/spend", s.handleSpend)
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
+	// The org control-plane management API is mounted only when a policy store is
+	// configured, and every route is admin-gated (see policy_admin.go).
+	if s.policy != nil {
+		mux.HandleFunc("GET /v1/policy", s.handlePolicyList)
+		mux.HandleFunc("POST /v1/policy/orgs", s.handleCreateOrg)
+		mux.HandleFunc("POST /v1/policy/teams", s.handleCreateTeam)
+		mux.HandleFunc("POST /v1/policy/apps", s.handleCreateApp)
+		mux.HandleFunc("PUT /v1/policy/nodes/{type}/{id}/limits", s.handleSetLimits)
+		mux.HandleFunc("POST /v1/policy/nodes/{type}/{id}/kill", s.handleNodeKill)
+		mux.HandleFunc("POST /v1/policy/nodes/{type}/{id}/unkill", s.handleNodeUnkill)
+		mux.HandleFunc("POST /v1/policy/keys", s.handleIssueKey)
+	}
 	return mux
 }
 

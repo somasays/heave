@@ -276,6 +276,27 @@ func TestOverAllocationNamesParent(t *testing.T) {
 	}
 }
 
+func TestSnapshotIsOrderedTree(t *testing.T) {
+	s := seed(t)
+	must(t, s.CreateApp("apex", "Apex", "eng", Limits{}))
+	must(t, s.Kill(App, "bot"))
+	snap := s.Snapshot()
+	if len(snap) != 4 { // org acme, team eng, app apex, app bot
+		t.Fatalf("want 4 nodes, got %d: %+v", len(snap), snap)
+	}
+	// Root-first, then by id: org▸team▸app(apex)▸app(bot).
+	order := []string{"org:acme", "team:eng", "app:apex", "app:bot"}
+	for i, want := range order {
+		if got := string(snap[i].Type) + ":" + snap[i].ID; got != want {
+			t.Fatalf("snapshot[%d] = %q, want %q", i, got, want)
+		}
+	}
+	// The killed flag and caps come through for the management view.
+	if !snap[3].Killed || snap[3].Limits.MaxUSDPerRun != 50 {
+		t.Fatalf("app bot view wrong: %+v", snap[3])
+	}
+}
+
 func TestResolveConcurrentWithWrites(t *testing.T) {
 	s := seed(t)
 	var wg sync.WaitGroup

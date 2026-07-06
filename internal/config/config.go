@@ -16,16 +16,26 @@ import (
 
 // Config is the whole gateway configuration.
 type Config struct {
-	Server    Server     `yaml:"server"`
-	Providers []Provider `yaml:"providers"`
-	Models    []Model    `yaml:"models"`
-	Routing   Routing    `yaml:"routing"`
-	Auth      Auth       `yaml:"auth"`
-	Clients   []Client   `yaml:"clients"`
-	Failover  Failover   `yaml:"failover"`
-	Redaction Redaction  `yaml:"redaction"`
-	Firewall  Firewall   `yaml:"firewall"`
-	Ledger    Ledger     `yaml:"ledger"`
+	Server       Server       `yaml:"server"`
+	Providers    []Provider   `yaml:"providers"`
+	Models       []Model      `yaml:"models"`
+	Routing      Routing      `yaml:"routing"`
+	Auth         Auth         `yaml:"auth"`
+	Clients      []Client     `yaml:"clients"`
+	Failover     Failover     `yaml:"failover"`
+	Redaction    Redaction    `yaml:"redaction"`
+	Firewall     Firewall     `yaml:"firewall"`
+	Ledger       Ledger       `yaml:"ledger"`
+	ControlPlane ControlPlane `yaml:"control_plane"`
+}
+
+// ControlPlane toggles the org control plane (ADR 0005/0006): the hierarchical
+// budget model + admin-gated management API. Off by default; when on, the store
+// starts empty and is provisioned via the management API (POST /v1/policy/...).
+// The in-memory store is not durable across restarts yet — a later increment adds
+// Postgres persistence.
+type ControlPlane struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // Firewall configures the runtime spend & quota firewall (Invariant #9): hard,

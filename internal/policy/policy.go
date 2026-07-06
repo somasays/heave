@@ -13,6 +13,7 @@ package policy
 
 import (
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 )
@@ -339,6 +340,39 @@ func tightest(a, b float64) float64 {
 		return b
 	}
 	return a
+}
+
+// NodeView is a read-only snapshot of a provisioned node for the management API
+// (the internal *Node is never exposed). Fields mirror Node minus the pointer.
+type NodeView struct {
+	Type     NodeType
+	ID       string
+	Name     string
+	ParentID string
+	Limits   Limits
+	Killed   bool
+}
+
+// Snapshot returns every provisioned node, ordered root-first (org▸team▸app) then
+// by id, so the management API renders a stable tree. Takes only a read lock.
+func (s *Store) Snapshot() []NodeView {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]NodeView, 0, len(s.nodes))
+	for _, n := range s.nodes {
+		out = append(out, NodeView{
+			Type: n.Type, ID: n.ID, Name: n.Name,
+			ParentID: n.ParentID, Limits: n.Limits, Killed: n.Killed,
+		})
+	}
+	rank := map[NodeType]int{Org: 0, Team: 1, App: 2}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Type != out[j].Type {
+			return rank[out[i].Type] < rank[out[j].Type]
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // OverAllocations returns human-readable warnings where a parent's children

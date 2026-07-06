@@ -25,6 +25,7 @@ import (
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
 	"github.com/somasays/heave/internal/pgledger"
+	"github.com/somasays/heave/internal/policy"
 	"github.com/somasays/heave/internal/provider"
 	"github.com/somasays/heave/internal/redact"
 	"github.com/somasays/heave/internal/redisstore"
@@ -176,10 +177,22 @@ func run(configPath string, log *slog.Logger) error {
 		}
 	}
 
+	// Org control plane (ADR 0006): when enabled, provision an empty in-memory
+	// policy store; operators populate it via the admin-gated management API. nil
+	// when off ⇒ the management routes are not mounted and enforcement is flat.
+	var polStore *policy.Store
+	if cfg.ControlPlane.Enabled {
+		polStore = policy.New()
+		log.Info("org control plane enabled (management API mounted at /v1/policy; store is in-memory, not durable across restarts)")
+		if !cfg.Auth.Enabled {
+			log.Warn("control plane is enabled but auth is DISABLED: the management API is unauthenticated; enable auth (with an admin key) before exposing it")
+		}
+	}
+
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
 		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb,
-		LedgerReader: ledgerReader, Log: log,
+		Policy: polStore, LedgerReader: ledgerReader, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,

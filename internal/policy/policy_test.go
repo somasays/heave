@@ -236,6 +236,20 @@ func TestBrokenChainFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDanglingKeyFailsClosed(t *testing.T) {
+	s := seed(t)
+	// Simulate a durable-store integrity fault: the key still maps to a node ref,
+	// but the node record is gone. This must fail CLOSED (ErrBrokenChain), NOT look
+	// like an unknown/ungoverned key — otherwise a caller downgrades a previously
+	// governed key to laxer enforcement.
+	s.mu.Lock()
+	delete(s.nodes, "app:bot")
+	s.mu.Unlock()
+	if _, err := s.Resolve("keyhash-bot", "r"); err != ErrBrokenChain {
+		t.Fatalf("a key pointing at a missing node must fail closed, got %v", err)
+	}
+}
+
 func TestCrossTenantRunKeysDistinct(t *testing.T) {
 	s := seed(t)
 	must(t, s.CreateApp("bot2", "Bot 2", "eng", Limits{}))

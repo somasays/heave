@@ -276,7 +276,11 @@ func (s *Store) Resolve(keySHA256, runID string) (Chain, error) {
 	}
 	leaf, ok := s.nodes[ref]
 	if !ok {
-		return Chain{}, ErrUnknownKey
+		// The key maps to a node that no longer exists — a data-integrity failure,
+		// NOT an ungoverned key. Fail CLOSED (ErrBrokenChain) so a caller cannot
+		// mistake it for "not provisioned" and downgrade to laxer enforcement.
+		// Unreachable via the current API (no delete); guards the durable store.
+		return Chain{}, ErrBrokenChain
 	}
 
 	// Walk to the org root, collecting ancestors leaf..org. A node claiming a

@@ -75,6 +75,20 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/policy is the org model + resolution; it must stay pure (no other internal packages)"
+        enforcer-boundary:
+          files: ["**/internal/enforcer/**"]
+          # The adapter that binds the policy model to the firewall engine. It may
+          # depend ONLY on those two pure packages, never on orchestration/logic —
+          # so the model↔engine seam stays a thin translation, not a back-channel.
+          deny:
+            - pkg: github.com/somasays/heave/internal/server
+            - pkg: github.com/somasays/heave/internal/router
+            - pkg: github.com/somasays/heave/internal/provider
+            - pkg: github.com/somasays/heave/internal/broker
+            - pkg: github.com/somasays/heave/internal/controls
+            - pkg: github.com/somasays/heave/internal/config
+            - pkg: github.com/somasays/heave/internal/ledger
+            - pkg: github.com/somasays/heave/internal/redisstore
         broker-pure:
           files: ["**/internal/broker/**"]
           deny:

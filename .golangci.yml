@@ -70,6 +70,11 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/firewall must stay pure (no other internal packages)"
+        policy-pure:
+          files: ["**/internal/policy/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/policy is the org model + resolution; it must stay pure (no other internal packages)"
         broker-pure:
           files: ["**/internal/broker/**"]
           deny:

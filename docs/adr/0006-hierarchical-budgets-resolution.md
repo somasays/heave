@@ -95,11 +95,25 @@ includes a killed node is denied (`403`, terminal). So:
 - `Σ(children caps) > parent cap` is **allowed** (umbrella model). The management
   API **warns** ("apps allocate $2,000 vs the $1,000 team cap") but does not block
   — it's a valid pattern.
-- Validation: caps ≥ 0; valid windows/tz; a key maps to exactly one node; node
-  names unique within a parent.
+- Validation: caps ≥ 0 (a negative cap is rejected, not silently applied — it
+  would deny every request on that scope); valid windows/tz; a key maps to
+  exactly one node; ids are a safe token (no `:`/NUL scope-key delimiters,
+  bounded length) and globally unique **per type** (the id, not just the name,
+  keys the node — stricter than "unique within a parent", which the resolver
+  relies on to build unambiguous scope keys).
 
 ## 9. Edge cases pinned
 - **No run id:** run-level caps don't apply; org/team/app still do (documented).
+- **Run id is untrusted input:** validated to a safe token before use (it flows
+  into the `run:<owner>\x00<id>` key); a run id can never reconstruct another
+  node's scope key because the run is namespaced under the caller's own leaf.
+  Rotating run ids each request buys a fresh per-run budget but not escape from
+  ancestor caps.
+- **Broken ancestry fails closed:** if a node's parent record is missing (a
+  durable-store integrity fault), resolution returns an error rather than a
+  chain with an ancestor's budget silently omitted — never under-enforce.
+- **Run-level kill** (§5) is a concern of the enforcement/reserve layer (runs
+  aren't provisioned nodes); node kills (org/team/app) live in this model.
 - **Parent exhausted mid-run:** subsequent requests denied (`429`), the run is
   *not* auto-killed — throttled, not terminated (unless a kill was issued).
 - **Estimate overshoot:** `actual > est` (chars/4 input error) can push a node

@@ -1,0 +1,34 @@
+# Example LiteLLM proxy config wiring the heave guardrail.
+# The ENTIRE integration is the `guardrails:` block below — LiteLLM's own hook
+# lifecycle then calls heave reserve/settle/release around every request.
+
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+guardrails:
+  - guardrail_name: heave
+    litellm_params:
+      guardrail: heave_guardrail.HeaveGuardrail
+      mode: pre_call          # reserve runs before the vendor call; deny blocks it
+      # These map to HeaveGuardrail.__init__ kwargs (or set HEAVE_URL / HEAVE_ADMIN_KEY env):
+      heave_url: http://heave:8080
+      heave_admin_key: os.environ/HEAVE_ADMIN_KEY   # a heave ADMIN key (the PEP credential)
+      # Optional: let the adapter estimate USD for $/min and per-run $ caps.
+      prices:
+        gpt-4o: { input_per_mtok: 2.5, output_per_mtok: 10.0 }
+
+# Per-request the caller identifies its heave scope via metadata or a header:
+#   X-Heave-Run-Id: run-abc123                 (the agent run — enables per-run caps + kill)
+#   metadata.heave_key_sha256: <hex>           (optional explicit scope; else derived
+#                                               from the sha256 of the caller's virtual key)
+#
+# Provision the org hierarchy + budgets in heave's control plane first:
+#   POST /v1/policy/orgs   {id,name,limits}
+#   POST /v1/policy/teams  {id,name,org_id,limits}
+#   POST /v1/policy/apps   {id,name,team_id,limits}
+#   POST /v1/policy/keys   {key_sha256|key, node_type, node_id}
+# heave itself must run with control_plane.enabled + firewall.redis_url + a
+# control_plane.guard_secret_env (>=32 bytes) so /v1/guard is mounted.

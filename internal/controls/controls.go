@@ -99,7 +99,12 @@ func New(authEnabled bool, clients []Client, now func() time.Time) *Guard {
 		if c.RateLimitRPM > 0 {
 			b = newBucket(float64(c.RateLimitRPM), float64(c.RateLimitRPM)/60.0)
 		}
-		g.byHash[strings.ToLower(c.KeySHA256)] = &clientState{cfg: c, bucket: b}
+		// Canonicalize the key hash to lowercase so the identity Admit/Authenticate
+		// HANDS BACK matches what downstream (e.g. the policy resolver) keys off — a
+		// mixed-case config hash must not auth as case-insensitive here yet resolve
+		// as a different (missed) key there, silently bypassing policy enforcement.
+		c.KeySHA256 = strings.ToLower(c.KeySHA256)
+		g.byHash[c.KeySHA256] = &clientState{cfg: c, bucket: b}
 	}
 	return g
 }

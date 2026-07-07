@@ -44,7 +44,7 @@ func TestResolveTranslatesChain(t *testing.T) {
 	}
 	// The run scope carries the tightest per-run cap (only the app set it).
 	run := scopes[len(scopes)-1]
-	if run.Name != "run" || run.Key != "run:app:bot\x00run-1" || run.Limits.MaxUSDPerRun != 0.5 {
+	if run.Name != "run" || run.Key != "run:app:bot\x00keyhash-bot\x00run-1" || run.Limits.MaxUSDPerRun != 0.5 {
 		t.Fatalf("run scope mistranslated: %+v", run)
 	}
 }

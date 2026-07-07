@@ -21,6 +21,7 @@ import (
 	"github.com/somasays/heave/internal/broker"
 	"github.com/somasays/heave/internal/config"
 	"github.com/somasays/heave/internal/controls"
+	"github.com/somasays/heave/internal/enforcer"
 	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
 	"github.com/somasays/heave/internal/ledger"
@@ -181,18 +182,20 @@ func run(configPath string, log *slog.Logger) error {
 	// policy store; operators populate it via the admin-gated management API. nil
 	// when off ⇒ the management routes are not mounted and enforcement is flat.
 	var polStore *policy.Store
+	var chainResolver server.ChainResolver
 	if cfg.ControlPlane.Enabled {
 		polStore = policy.New()
+		chainResolver = enforcer.NewResolver(polStore) // resolves + enforces per-scope on the request path
 		log.Info("org control plane enabled (management API mounted at /v1/policy; store is in-memory, not durable across restarts)")
 		if !cfg.Auth.Enabled {
-			log.Warn("control plane is enabled but auth is DISABLED: the management API is unauthenticated; enable auth (with an admin key) before exposing it")
+			log.Warn("control plane is enabled but auth is DISABLED: the management API is unauthenticated and no key maps to a policy node; enable auth (with an admin key) before exposing it")
 		}
 	}
 
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
 		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb,
-		Policy: polStore, LedgerReader: ledgerReader, Log: log,
+		Policy: polStore, Resolver: chainResolver, LedgerReader: ledgerReader, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,

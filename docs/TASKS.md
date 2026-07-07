@@ -241,6 +241,11 @@ request fits under every ancestor. Open-core decision: RESOLVED — publish publ
   key. Until this lands, provisioned budgets are NOT enforced on live traffic.
 - ⬜ **6.6** durable Postgres policy store; calendar (Day/Month) enforcement (needs
   the ledger); deny responses naming the binding node.
+- ⬜ **6.6a governance gap (from 6.5 review):** a governed key can OPT OUT of the
+  per-run $ cap + loop detection by omitting `X-Heave-Run-Id` (ancestor velocity/
+  concurrency + monthly budget still bind). Documented in ADR 0006 §9. Options: a
+  per-node `require_run_id`, or synthesize a per-request run scope so the app-level
+  `MaxUSDPerRun` still applies. Decide + implement.
 - ⬜ **6.7 stale docs** — README "Where it sits" + `docs/DEPLOYMENT.md` still carry
   the rejected inline-proxy framing; rewrite around the PDP/control-plane model.
 

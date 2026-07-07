@@ -42,6 +42,7 @@ type Server struct {
 	firewall       *firewall.Firewall
 	broker         *broker.Broker
 	policy         *policy.Store // nil ⇒ control plane off (routes not mounted)
+	resolver       ChainResolver // nil ⇒ flat enforcement (no chain resolution)
 	ledgerReader   LedgerReader
 	log            *slog.Logger
 	maxRequestBody int64
@@ -55,6 +56,16 @@ type LedgerReader interface {
 	TopSpendSince(ctx context.Context, since time.Time, n int) (byClient, byRun []ledger.NamedStat, err error)
 }
 
+// ChainResolver maps a request (bearer sha + run id) to the firewall scope chain
+// it must satisfy under the org control plane. Injected only when the control
+// plane is on; nil ⇒ flat per-key/run enforcement (today's behavior). Implemented
+// by enforcer.Resolver. The contract is fail-CLOSED: governed=false,err=nil means
+// "not policy-governed" (caller uses flat enforcement); a non-nil err is a
+// resolution FAILURE the caller must deny on, never downgrade.
+type ChainResolver interface {
+	Resolve(keySHA256, runID string) (scopes []firewall.Scope, killedBy string, governed bool, err error)
+}
+
 // Deps bundles the collaborators the server orchestrates.
 type Deps struct {
 	Router       *router.Router
@@ -66,6 +77,7 @@ type Deps struct {
 	Firewall     *firewall.Firewall
 	Broker       *broker.Broker
 	Policy       *policy.Store // optional org control plane; nil ⇒ management API off
+	Resolver     ChainResolver // optional chain resolver; nil ⇒ flat enforcement
 	LedgerReader LedgerReader
 	Log          *slog.Logger
 }
@@ -114,6 +126,7 @@ func New(d Deps, opts Options) *Server {
 		firewall:       d.Firewall,
 		broker:         d.Broker,
 		policy:         d.Policy,
+		resolver:       d.Resolver,
 		ledgerReader:   d.LedgerReader,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
@@ -149,7 +162,10 @@ func (s *Server) Handler() http.Handler {
 // handleKillRun hard-stops an agent run: every subsequent request on it is
 // rejected. Requires a valid API key when auth is enabled.
 func (s *Server) handleKillRun(w http.ResponseWriter, r *http.Request) {
-	client, err := s.guard.Admit(bearerToken(r))
+	// Authenticate (not Admit) so the kill switch stays reachable even when the
+	// client has exhausted its chat RPM — a safety control you can't reach under
+	// load is worse than useless. Killing only affects the caller's own runs.
+	client, err := s.guard.Authenticate(bearerToken(r))
 	if err != nil {
 		s.denied(w, nil, err)
 		return
@@ -167,10 +183,24 @@ func (s *Server) handleKillRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A caller can only kill its own runs (scoped by the authenticated key). This
-	// MUST match the owner the request path uses (clientName), or a kill would
-	// target a different run scope than the traffic it means to stop.
+	// MUST match the run key the request path RESERVES under, or a kill would target
+	// a different run scope than the traffic it means to stop. Under the control
+	// plane that key is the policy run scope key (namespaced by the resolved leaf);
+	// otherwise it's the flat owner-scoped key.
 	ownerKey := clientName(client)
-	if err := s.firewall.Kill(ownerKey, runID); err != nil {
+	runKey, governed, rerr := s.resolveRunKey(clientKeySHA(client), runID)
+	if rerr != nil {
+		s.log.Error("kill denied: policy resolution failed", "run_id", runID, "err", rerr)
+		writeError(w, http.StatusInternalServerError, "api_error", "policy resolution failed")
+		return
+	}
+	var killErr error
+	if governed {
+		killErr = s.firewall.KillRun(runKey)
+	} else {
+		killErr = s.firewall.Kill(ownerKey, runID)
+	}
+	if err := killErr; err != nil {
 		// The kill did not durably record (local map full, or shared-store write
 		// failed). Report failure rather than a false 200 — a kill switch that
 		// lies is worse than one that asks for a retry.
@@ -379,7 +409,35 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			"X-Heave-Run-Id must be 1-128 chars of [A-Za-z0-9._-]")
 		return
 	}
-	ticket, ferr := s.firewall.Enter(fwKey, runID, promptHash(&req), estUSD, estTokens)
+	// Resolve the org policy chain if the control plane governs this key, and
+	// enforce per-scope; otherwise fall back to flat per-key/run enforcement.
+	scopes, killedBy, governed, rerr := s.resolveChain(clientKeySHA(client), runID)
+	if rerr != nil {
+		// Fail CLOSED: a resolution failure (a broken/dangling node chain — a
+		// server-side data-integrity fault, not the caller's fault) must deny, never
+		// drop to laxer flat enforcement. 5xx, since retry may succeed once fixed.
+		s.guard.Settle(reservation, 0)
+		s.log.Error("request denied: policy resolution failed", "key", fwKey, "err", rerr)
+		writeError(w, http.StatusInternalServerError, "api_error", "policy resolution failed")
+		return
+	}
+	if governed && killedBy != "" {
+		// A killed org/team/app in the chain (a node circuit breaker) — the firewall
+		// only sees run-level kills, so the caller denies node kills before EnterChain.
+		// Naming the binding node keeps the deny actionable (ADR 0006 §6); the caller
+		// is inside that node's chain, so it is not cross-tenant disclosure.
+		s.guard.Settle(reservation, 0)
+		s.log.Warn("request denied", "reason", "node_killed", "node", killedBy, "key", fwKey, "run_id", runID)
+		writeError(w, http.StatusForbidden, "policy_killed", "blocked: "+killedBy+" is killed")
+		return
+	}
+	var ticket *firewall.Ticket
+	var ferr error
+	if governed {
+		ticket, ferr = s.firewall.EnterChain(scopes, promptHash(&req), estUSD, estTokens)
+	} else {
+		ticket, ferr = s.firewall.Enter(fwKey, runID, promptHash(&req), estUSD, estTokens)
+	}
 	if ferr != nil {
 		s.guard.Settle(reservation, 0)
 		s.firewallDenied(w, fwKey, runID, ferr)
@@ -763,6 +821,49 @@ func clientName(client *controls.Client) string {
 		return client.Name
 	}
 	return ""
+}
+
+// clientKeySHA is the authenticated key's hex SHA-256 (the policy key identity),
+// or "" when auth is off (client nil) — which resolves as ungoverned. Lowercased
+// so it matches the canonical form the policy store is keyed by (a mixed-case
+// config hash must never resolve as a different, missed key → silent bypass).
+func clientKeySHA(client *controls.Client) string {
+	if client != nil {
+		return strings.ToLower(client.KeySHA256)
+	}
+	return ""
+}
+
+// resolveChain resolves the request's policy chain, or reports ungoverned when no
+// resolver is configured (flat enforcement).
+func (s *Server) resolveChain(keySHA256, runID string) (scopes []firewall.Scope, killedBy string, governed bool, err error) {
+	if s.resolver == nil {
+		return nil, "", false, nil
+	}
+	return s.resolver.Resolve(keySHA256, runID)
+}
+
+// resolveRunKey returns the firewall run key a kill must target: the policy run
+// scope key when the control plane governs the caller (governed=true), else "" with
+// governed=false so the caller uses the flat Kill(ownerKey,runID). A resolution
+// failure is surfaced so the kill fails closed rather than targeting a wrong key.
+func (s *Server) resolveRunKey(keySHA256, runID string) (runKey string, governed bool, err error) {
+	if s.resolver == nil {
+		return "", false, nil
+	}
+	scopes, _, gov, rerr := s.resolver.Resolve(keySHA256, runID)
+	if rerr != nil {
+		return "", false, rerr
+	}
+	if !gov {
+		return "", false, nil
+	}
+	for _, sc := range scopes {
+		if sc.Name == "run" {
+			return sc.Key, true, nil
+		}
+	}
+	return "", false, nil // governed but no run scope (e.g. key on a node, empty run) → flat
 }
 
 // validRunID constrains a run id to a single safe token, enforced identically on

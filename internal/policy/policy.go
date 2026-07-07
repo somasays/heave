@@ -317,11 +317,16 @@ func (s *Store) Resolve(keySHA256, runID string) (Chain, error) {
 	}
 
 	if runID != "" {
-		// Namespace the run under its app (leaf) so run ids can't collide or be
-		// spoofed across tenants.
+		// Namespace the run under BOTH the leaf node AND the specific KEY, so:
+		//   - run ids can't collide or be spoofed across tenants (leaf prefix), and
+		//   - two distinct keys mapped to the SAME node get DISTINCT run scopes —
+		//     a run id is caller-chosen and not secret, so without the key in the
+		//     namespace one key could kill or share another sibling key's run.
+		// keySHA256 is the canonical (lowercased hex) key identity; the NUL
+		// separators keep the composite key unambiguous.
 		ch.Scopes = append(ch.Scopes, Scope{
 			Name:   "run",
-			Key:    "run:" + leaf.scopeKey() + "\x00" + runID,
+			Key:    "run:" + leaf.scopeKey() + "\x00" + keySHA256 + "\x00" + runID,
 			Limits: Limits{MaxUSDPerRun: runCap},
 		})
 	}

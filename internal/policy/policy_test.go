@@ -39,7 +39,7 @@ func TestResolveChainAndCaps(t *testing.T) {
 		{"org", "org:acme"},
 		{"team", "team:eng"},
 		{"app", "app:bot"},
-		{"run", "run:app:bot\x00run-1"},
+		{"run", "run:app:bot\x00keyhash-bot\x00run-1"},
 	}
 	for i, w := range want {
 		if ch.Scopes[i].Name != w.name || ch.Scopes[i].Key != w.key {
@@ -162,9 +162,9 @@ func TestKeyOnTeamChain(t *testing.T) {
 	if ch.Scopes[0].Key != "org:acme" || ch.Scopes[1].Key != "team:eng" {
 		t.Fatalf("unexpected ancestry: %+v", ch.Scopes)
 	}
-	// The run is namespaced under the team leaf, not an app.
-	if ch.Scopes[2].Key != "run:team:eng\x00r" {
-		t.Fatalf("run must namespace under the team leaf, got %q", ch.Scopes[2].Key)
+	// The run is namespaced under the team leaf AND the key, not an app.
+	if ch.Scopes[2].Key != "run:team:eng\x00keyhash-team\x00r" {
+		t.Fatalf("run must namespace under the team leaf + key, got %q", ch.Scopes[2].Key)
 	}
 }
 
@@ -261,6 +261,21 @@ func TestCrossTenantRunKeysDistinct(t *testing.T) {
 	kb := b.Scopes[len(b.Scopes)-1].Key
 	if ka == kb {
 		t.Fatalf("run keys must differ across tenants, both were %q", ka)
+	}
+}
+
+func TestSameAppDistinctKeysGetDistinctRunScopes(t *testing.T) {
+	s := seed(t)
+	// A second key mapped to the SAME app (bot). Two keys under one node is a legal
+	// pattern; a caller-chosen run id is not secret, so the two keys must NOT share a
+	// run scope (else one key could kill or pollute the other's run).
+	must(t, s.IssueKey("keyhash-bot-2", App, "bot"))
+	a, _ := s.Resolve("keyhash-bot", "same-run")
+	b, _ := s.Resolve("keyhash-bot-2", "same-run")
+	ka := a.Scopes[len(a.Scopes)-1].Key
+	kb := b.Scopes[len(b.Scopes)-1].Key
+	if ka == kb {
+		t.Fatalf("distinct keys under one app must get distinct run scopes, both were %q", ka)
 	}
 }
 

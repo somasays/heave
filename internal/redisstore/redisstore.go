@@ -100,6 +100,22 @@ func (s *Store) Killed(runKey string) bool {
 	return err == nil && n > 0
 }
 
+// ClaimReconcile atomically records a reservation nonce as reconciled and reports
+// whether this call CLAIMED it (true) or it was already claimed (false), fleet-wide
+// via Redis SET NX EX. It makes the decision API's settle/release idempotent across
+// replicas (a stateless reservation token can be reconciled on any replica, so the
+// dedup must be shared, not per-instance). ttlSec should be >= the reservation
+// lease so a nonce cannot expire while its token is still valid.
+func (s *Store) ClaimReconcile(nonce string, ttlSec int) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+	defer cancel()
+	ok, err := s.rdb.SetNX(ctx, "heave:rcl:"+nonce, "1", time.Duration(ttlSec)*time.Second).Result()
+	if err != nil {
+		return false, fmt.Errorf("redis claim reconcile: %w", err)
+	}
+	return ok, nil
+}
+
 // Ping verifies connectivity (used at startup to fail fast on misconfiguration).
 func (s *Store) Ping(ctx context.Context) error { return s.rdb.Ping(ctx).Err() }
 

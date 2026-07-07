@@ -183,6 +183,8 @@ func run(configPath string, log *slog.Logger) error {
 	// when off ⇒ the management routes are not mounted and enforcement is flat.
 	var polStore *policy.Store
 	var chainResolver server.ChainResolver
+	var guardSecret []byte
+	var guardDedup server.GuardDedup
 	if cfg.ControlPlane.Enabled {
 		polStore = policy.New()
 		chainResolver = enforcer.NewResolver(polStore) // resolves + enforces per-scope on the request path
@@ -190,12 +192,29 @@ func run(configPath string, log *slog.Logger) error {
 		if !cfg.Auth.Enabled {
 			log.Warn("control plane is enabled but auth is DISABLED: the management API is unauthenticated and no key maps to a policy node; enable auth (with an admin key) before exposing it")
 		}
+		if env := cfg.ControlPlane.GuardSecretEnv; env != "" {
+			secret := []byte(os.Getenv(env))
+			switch {
+			case len(secret) < 32:
+				log.Warn("control_plane.guard_secret_env is set but the secret is missing/too short (<32 bytes); the /v1/guard decision API is OFF", "env", env)
+			case sharedStore == nil:
+				// The decision API's cross-replica idempotency + orphaned-hold reaping
+				// both depend on the shared store; without it, it silently under-enforces.
+				log.Warn("control_plane.guard_secret_env is set but the /v1/guard decision API requires the shared store (set firewall.redis_url) for cross-replica idempotency and orphaned-hold reaping; guard API is OFF")
+			default:
+				guardSecret = secret
+				guardDedup = sharedStore // redisstore satisfies server.GuardDedup (SET NX)
+				log.Info("OOB decision API enabled (/v1/guard/reserve|settle|release; admin-gated, signed reservation tokens, redis-backed)")
+			}
+		}
 	}
 
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
 		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb,
-		Policy: polStore, Resolver: chainResolver, LedgerReader: ledgerReader, Log: log,
+		Policy: polStore, Resolver: chainResolver,
+		GuardSecret: guardSecret, GuardDedup: guardDedup,
+		LedgerReader: ledgerReader, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
 		RequestTimeout:  cfg.Server.RequestTimeout,

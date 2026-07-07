@@ -889,3 +889,39 @@ func TestEnterChainNegativeEstimateCannotDeflateCounter(t *testing.T) {
 	}
 	t1.Release()
 }
+
+// --- Reservation: settle/release a held reserve WITHOUT the original ticket (ADR 0007) ---
+
+func TestReservationSettleReconcilesStatelessly(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	c := chain(Limits{MaxUSDPerMin: 1.0}, Limits{}, Limits{}, Limits{})
+	tk, err := f.EnterChain(c, "h", 0.9, 0) // hold 0.9 in the org window
+	if err != nil {
+		t.Fatalf("0.9 must admit, got %v", err)
+	}
+	resv := tk.Reservation() // capture reconcile state; do NOT release inline
+	// A different request sees the 0.9 hold: 0.9 + 0.2 > 1.0 → denied.
+	if _, err := f.EnterChain(c, "h", 0.2, 0); !errors.As(err, new(*VelocityError)) {
+		t.Fatalf("the held reserve must bind other requests, got %v", err)
+	}
+	// Settle the reservation to a real 0.1 (no original ticket used) → window drops.
+	f.SettleReservation(resv, 0.1, 0)
+	if tk2, err := f.EnterChain(c, "h", 0.85, 0); err != nil { // 0.1 + 0.85 < 1.0
+		t.Fatalf("after stateless settle the window must reflect the actual 0.1, got %v", err)
+	} else {
+		tk2.Release()
+	}
+}
+
+func TestReservationReleaseFreesHold(t *testing.T) {
+	f := New(true, Limits{}, nil)
+	c := chain(Limits{MaxUSDPerMin: 1.0}, Limits{}, Limits{}, Limits{})
+	tk, _ := f.EnterChain(c, "h", 0.9, 0)
+	resv := tk.Reservation()
+	f.ReleaseReservation(resv)                                 // the call never billed → fully unwind the hold
+	if tk2, err := f.EnterChain(c, "h", 0.95, 0); err != nil { // 0 + 0.95 < 1.0
+		t.Fatalf("release must free the whole hold, got %v", err)
+	} else {
+		tk2.Release()
+	}
+}

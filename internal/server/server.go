@@ -43,6 +43,8 @@ type Server struct {
 	broker         *broker.Broker
 	policy         *policy.Store // nil ⇒ control plane off (routes not mounted)
 	resolver       ChainResolver // nil ⇒ flat enforcement (no chain resolution)
+	guardSecret    []byte        // HMAC key for reservation tokens; nil ⇒ /v1/guard off
+	guardDedup     GuardDedup    // shared settle/release idempotency (required for guard)
 	ledgerReader   LedgerReader
 	log            *slog.Logger
 	maxRequestBody int64
@@ -78,6 +80,8 @@ type Deps struct {
 	Broker       *broker.Broker
 	Policy       *policy.Store // optional org control plane; nil ⇒ management API off
 	Resolver     ChainResolver // optional chain resolver; nil ⇒ flat enforcement
+	GuardSecret  []byte        // HMAC key for the /v1/guard decision API; nil/short ⇒ off
+	GuardDedup   GuardDedup    // shared reconcile dedup (required to enable the guard API)
 	LedgerReader LedgerReader
 	Log          *slog.Logger
 }
@@ -116,6 +120,17 @@ func New(d Deps, opts Options) *Server {
 	if d.Log == nil {
 		d.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
+	// The /v1/guard decision API needs ALL THREE, else it stays off (fail closed):
+	//   - a strong (>=32B) HMAC secret, so reservation tokens can't be forged;
+	//   - a shared reconcile dedup, so settle/release are idempotent ACROSS replicas
+	//     (a stateless token can be settled on any replica);
+	//   - a firewall backed by the shared store, so an orphaned reserve's hold is
+	//     reaped by the store's hold-TTL (local mode would pin it forever).
+	guardReady := len(d.GuardSecret) >= 32 && d.GuardDedup != nil && d.Firewall.HasScopeStore()
+	if !guardReady {
+		d.GuardSecret = nil
+		d.GuardDedup = nil
+	}
 	return &Server{
 		router:         d.Router,
 		providers:      d.Providers,
@@ -127,6 +142,8 @@ func New(d Deps, opts Options) *Server {
 		broker:         d.Broker,
 		policy:         d.Policy,
 		resolver:       d.Resolver,
+		guardSecret:    d.GuardSecret,
+		guardDedup:     d.GuardDedup,
 		ledgerReader:   d.LedgerReader,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
@@ -155,6 +172,13 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/policy/nodes/{type}/{id}/kill", s.handleNodeKill)
 		mux.HandleFunc("POST /v1/policy/nodes/{type}/{id}/unkill", s.handleNodeUnkill)
 		mux.HandleFunc("POST /v1/policy/keys", s.handleIssueKey)
+	}
+	// The OOB decision API (ADR 0007) — mounted only with a configured guard secret;
+	// admin-gated (the caller is a trusted PEP asserting scope on tenants' behalf).
+	if s.guardSecret != nil {
+		mux.HandleFunc("POST /v1/guard/reserve", s.handleGuardReserve)
+		mux.HandleFunc("POST /v1/guard/settle", s.handleGuardSettle)
+		mux.HandleFunc("POST /v1/guard/release", s.handleGuardRelease)
 	}
 	return mux
 }

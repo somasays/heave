@@ -386,6 +386,12 @@ func (s *memKillStore) stats() (size int, rejected uint64) {
 // Enabled reports whether the firewall enforces anything.
 func (f *Firewall) Enabled() bool { return f.enabled }
 
+// HasScopeStore reports whether velocity/concurrency (and thus decision-API holds)
+// are backed by a shared store — which reaps orphaned concurrency holds via its
+// hold-TTL. The /v1/guard API relies on this for orphaned-reserve self-heal, so it
+// is mounted only when this is true.
+func (f *Firewall) HasScopeStore() bool { return f.scopeStore != nil }
+
 // Ticket is a held reservation. Release MUST be called on every path (defer);
 // Settle is called once on a successful vendor response to reconcile the held
 // estimate to the actual spend.
@@ -780,6 +786,63 @@ func (tk *Ticket) Release() {
 			tk.fw.scopeDegraded.Add(1)
 		}
 	}
+}
+
+// Reservation is the SERIALIZABLE reconcile state of a held Ticket. The decision
+// API (ADR 0007) reserves inline, hands the caller a signed token carrying this
+// state, and later settles/releases by rebuilding a Ticket from it — so a reserve
+// can be reconciled WITHOUT the original in-memory Ticket, and (in shared mode)
+// from a different replica than the one that reserved. It carries no secret; the
+// server signs it so it can't be forged/edited.
+type Reservation struct {
+	ScopeKeys   []string `json:"sk,omitempty"`
+	RunScopeKey string   `json:"rk,omitempty"`
+	Shared      bool     `json:"sh,omitempty"` // reserved against the shared store (vs local windows)
+	StoreKeys   []string `json:"tk,omitempty"`
+	HoldID      string   `json:"h,omitempty"`
+	EstUSD      float64  `json:"u,omitempty"`
+	EstTokens   int      `json:"t,omitempty"`
+}
+
+// Reservation exports a held ticket's reconcile state for the decision API. Call
+// it on an admitted ticket that will NOT be Released inline (the hold persists
+// until SettleReservation/ReleaseReservation, or the lease/window self-heals it).
+func (tk *Ticket) Reservation() Reservation {
+	return Reservation{
+		ScopeKeys: tk.scopeKeys, RunScopeKey: tk.runScopeKey,
+		Shared: tk.store != nil, StoreKeys: tk.storeKeys, HoldID: tk.holdID,
+		EstUSD: tk.estUSD, EstTokens: tk.estTokens,
+	}
+}
+
+// ticketFrom rebuilds a Ticket from a Reservation, bound to this firewall. In
+// shared mode it re-attaches the scope store so reconcile hits the cross-replica
+// counters; in local mode it reconciles this instance's windows (an evicted scope
+// is skipped safely by Settle/Release).
+func (f *Firewall) ticketFrom(r Reservation) *Ticket {
+	tk := &Ticket{
+		fw: f, scopeKeys: r.ScopeKeys, runScopeKey: r.RunScopeKey,
+		storeKeys: r.StoreKeys, holdID: r.HoldID, estUSD: r.EstUSD, estTokens: r.EstTokens,
+	}
+	if r.Shared {
+		tk.store = f.scopeStore
+	}
+	return tk
+}
+
+// SettleReservation reconciles a decision-API reservation to actual usage AND frees
+// its hold — the successful-call path (settle + release in one). Idempotency across
+// repeated calls is the caller's responsibility (the reservation token's nonce).
+func (f *Firewall) SettleReservation(r Reservation, actualUSD float64, actualTokens int) {
+	tk := f.ticketFrom(r)
+	tk.Settle(actualUSD, actualTokens)
+	tk.Release()
+}
+
+// ReleaseReservation unwinds a decision-API reservation whose call never billed
+// (the failed/aborted path): the held estimate is removed and the hold freed.
+func (f *Firewall) ReleaseReservation(r Reservation) {
+	f.ticketFrom(r).Release()
 }
 
 // KillRun hard-stops the run identified by its EXACT run scope key — the same key

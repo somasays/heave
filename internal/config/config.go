@@ -36,6 +36,11 @@ type Config struct {
 // Postgres persistence.
 type ControlPlane struct {
 	Enabled bool `yaml:"enabled"`
+	// GuardSecretEnv names the env var holding the HMAC secret (>=32 bytes) that
+	// signs /v1/guard reservation tokens (ADR 0007). Like all secrets it comes from
+	// the ENVIRONMENT, never the file (Invariant #4). Empty ⇒ the OOB decision API
+	// is OFF (only the inline path + management API are available).
+	GuardSecretEnv string `yaml:"guard_secret_env"`
 }
 
 // Firewall configures the runtime spend & quota firewall (Invariant #9): hard,

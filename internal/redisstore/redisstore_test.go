@@ -97,3 +97,27 @@ func TestKillIsVisibleAcrossInstances(t *testing.T) {
 		t.Fatal("a kill on one replica must be visible on another sharing Redis")
 	}
 }
+
+func TestClaimReconcileIsIdempotent(t *testing.T) {
+	s, _ := newTestStore(t, time.Hour)
+	// First claim of a nonce wins; a replay (any replica) sees it already claimed —
+	// this is what makes the decision API's settle/release idempotent fleet-wide.
+	if ok, err := s.ClaimReconcile("nonce-1", 300); err != nil || !ok {
+		t.Fatalf("first claim must succeed, got ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.ClaimReconcile("nonce-1", 300); err != nil || ok {
+		t.Fatalf("a replayed claim must report already-claimed (false), got ok=%v err=%v", ok, err)
+	}
+	// A different nonce is independent.
+	if ok, _ := s.ClaimReconcile("nonce-2", 300); !ok {
+		t.Fatal("a distinct nonce must claim independently")
+	}
+}
+
+func TestClaimReconcileErrorsWhenRedisDown(t *testing.T) {
+	s, mr := newTestStore(t, time.Hour)
+	mr.Close()
+	if _, err := s.ClaimReconcile("n", 300); err == nil {
+		t.Fatal("a claim against a dead Redis must return an error so the caller can decide")
+	}
+}

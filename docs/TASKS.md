@@ -234,11 +234,10 @@ request fits under every ancestor. Open-core decision: RESOLVED — publish publ
 - ✅ **6.4 management API** (`internal/server/policy_admin.go`) — admin-gated CRUD
   over the hierarchy + `Snapshot`; `control_plane.enabled` config + cmd wiring.
   Tests cover flow/gating/errors. (Store is in-memory; not durable across restarts.)
-- ⬜ **6.5 LIVE ENFORCEMENT WIRING** — ⚠ THE ENGINE IS NOT YET IN THE REQUEST PATH.
-  `handleChatCompletions` still calls flat `Enter`, NOT the resolver+`EnterChain`.
-  Do: server resolves the chain per request via `enforcer.Resolve`, denies on
-  `chain.KilledBy` (+ test), calls `EnterChain`; kill endpoint uses the run scope
-  key. Until this lands, provisioned budgets are NOT enforced on live traffic.
+- ✅ **6.5 LIVE ENFORCEMENT WIRING** — the engine is IN the request path:
+  `handleChatCompletions` resolves the chain (enforcer), denies on `KilledBy`,
+  calls `EnterChain`; kill uses the run scope key. Reviews: Go + security
+  (CHANGES-NEEDED → fixed: keySHA case fail-open M1, per-key run isolation S1).
 - ⬜ **6.6** durable Postgres policy store; calendar (Day/Month) enforcement (needs
   the ledger); deny responses naming the binding node.
 - ⬜ **6.6a governance gap (from 6.5 review):** a governed key can OPT OUT of the
@@ -249,21 +248,21 @@ request fits under every ancestor. Open-core decision: RESOLVED — publish publ
 - ⬜ **6.7 stale docs** — README "Where it sits" + `docs/DEPLOYMENT.md` still carry
   the rejected inline-proxy framing; rewrite around the PDP/control-plane model.
 
-## Phase 7 — OOB integration surface (the PDP wedge) — 📐 DESIGN-ONLY, NO CODE YET
-This is what the LiteLLM/Envoy/library integration story is PINNED ON. Today the
-engine is reachable ONLY inline (send the chat completion THROUGH heave). There is
-NO standalone decision API and NO adapter.
-- ⬜ **7.1 ADR 0007** — the `/v1/guard/*` decision API: reserve/settle/release as a
-  PURE decision (scope + a number, never the payload); reservation = a LEASE with a
-  TTL so a missing settle/release self-heals.
-- ⬜ **7.2 `/v1/guard/reserve|settle|release` endpoints** wrapping
-  `EnterChain`/`Ticket.Settle`/`Ticket.Release`. Reserve returns `{admitted,
-  reservation_id, http_status, deny_reason(binding node)}`. Reviews: Go + security.
-- ⬜ **7.3 LiteLLM adapter** — a `CustomGuardrail` (Python) mapping
-  pre_call→reserve, post_success→settle, post_failure→release; threads the
-  reservation id via `data["metadata"]`; maps LiteLLM team/key→heave scope. Ships
-  as an example + package. (Skeleton exists only in chat, NOT in the repo.)
-- ⬜ **7.4** other PEPs: Envoy `ext_authz`, a Go client lib.
+## Phase 7 — OOB integration surface (the PDP wedge) — BUILT + PUSHED
+The engine is now reachable as a PURE decision (scope + estimate, never payload),
+so a PEP enforces heave OOB with no data-path hop.
+- ✅ **7.1 ADR 0007** — the `/v1/guard/*` decision API (signed stateless
+  reservation token; shared-store-backed lease + idempotency).
+- ✅ **7.2 `/v1/guard/reserve|settle|release`** wrapping EnterChain/Settle/Release;
+  signed reservation tokens; redis-NX idempotency; requires the shared store.
+  Reviews: Go + security (both CHANGES-NEEDED → fixed: M1 cross-replica replay, M2
+  orphaned-hold leak, S1 negative-actual) + a verification re-review (PASS, N1
+  degraded-reserve leak folded).
+- ✅ **7.3 LiteLLM adapter** (`integrations/litellm/`) — the reference
+  `CustomGuardrail`: pre_call→reserve, post_success→settle, post_failure→release;
+  reservation id via metadata; example config + README.
+- ⬜ **7.4** other PEPs: Envoy `ext_authz`, a Go client lib. Also: price the reserve
+  heave-side (by model) so a PEP needn't carry a price map.
 
 ## Phase 8 — Admin console + SSO (enterprise-ready) — 🟡 WIP (core uncommitted)
 - ✅ **8.0 design** — console mockup (SSO sign-in + org spend/budget views); shared

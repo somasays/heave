@@ -185,9 +185,20 @@ func (s *Server) handleGuardReserve(w http.ResponseWriter, r *http.Request) {
 	}
 	// Admitted: the hold PERSISTS (no inline Release) until settle/release or the
 	// lease self-heals. Capture its reconcile state into a signed token.
-	tokenID, err := s.signReservation(ticket.Reservation())
+	resv := ticket.Reservation()
+	if !resv.Shared && len(resv.ScopeKeys) > 0 {
+		// The shared reserve DEGRADED to a LOCAL hold (Redis unreachable at reserve
+		// time). A local hold has no TTL reaper, so persisting it past this call would
+		// leak concurrency/scope (the M2 defect, re-manifested under an outage). Fail
+		// OPEN like the inline path: release the hold NOW (while we still hold the
+		// ticket) and hand back a no-op reservation, so the PEP's settle/release still
+		// succeed but no hold is stranded.
+		ticket.Release()
+		resv = firewall.Reservation{}
+	}
+	tokenID, err := s.signReservation(resv)
 	if err != nil {
-		ticket.Release() // couldn't hand back a handle → don't leak the hold
+		ticket.Release() // idempotent; couldn't hand back a handle → don't leak the hold
 		writeError(w, http.StatusInternalServerError, "api_error", "could not issue reservation")
 		return
 	}

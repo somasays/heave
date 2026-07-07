@@ -55,7 +55,8 @@ enforcement engine to drift.
   velocity/concurrency — retryable) or **403** (killed — terminal). Mirrors the
   inline deny semantics (ADR 0006 §6).
 - `binding_node` names the scope that denied (actionable); omitted when not
-  applicable. `reason ∈ {velocity, concurrency, killed, per_run_budget}`.
+  applicable. `reason ∈ {velocity, concurrency, killed}`. (A per-run-$ breach
+  auto-kills the run, so it surfaces as `killed`, not a distinct reason.)
 - The estimate is the PEP's upper bound: input tokens (countable) + `max_tokens`
   (the output bound) × price. `settle` replaces it with real usage.
 

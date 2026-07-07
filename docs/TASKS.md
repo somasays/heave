@@ -212,37 +212,70 @@ scope. ~80% reuse of what's built (auth, reserve/settle, rate, failover, ledger)
   snapshots); spend-velocity panel. Durable-ledger retention/partitioning
   automation (today an operator responsibility).
 
-## Phase 6 — Org control plane (hierarchical budgets) — IN PROGRESS, committed LOCALLY (not pushed: open-core boundary undecided)
-Specs: ADR 0004 (enforcement integration contract), 0005 (control-plane topology),
-0006 (hierarchical budgets & resolution). Umbrella model: a budget at any node
-caps aggregate spend at/under it; admit iff a request fits under every ancestor.
+## STATUS LEGEND (anti-overstatement — the whole point of this list)
+✅ BUILT = code merged, gated (`make check`), dual-reviewed, PUSHED.
+🟡 WIP = code exists but NOT gated/reviewed/wired — do NOT describe as working.
+📐 DESIGN-ONLY = an ADR/mockup exists, NO code. Never claim a capability from an ADR.
+⬜ TODO = not started.
+Rule to avoid boo-boos: before claiming any capability, `grep` the code for the
+endpoint/function. "Designed" ≠ "built". Every ✅ requires build→2 reviews→gate→commit.
+
+## Phase 6 — Org control plane (model + management) — PUSHED (public repo)
+Specs: ADR 0004 (integration contract), 0005 (topology), 0006 (hierarchical budgets).
+Umbrella model: a budget at any node caps aggregate spend at/under it; admit iff a
+request fits under every ancestor. Open-core decision: RESOLVED — publish publicly.
 - ✅ **6.1 policy model + resolver** (`internal/policy`) — org▸team▸app▸run,
-  budget at any node, `Resolve(keySHA,runID)→Chain` (org-first scopes + tightest
-  per-run cap). Fail-closed: negative caps rejected, ids/run-ids validated (no
-  `:`/NUL), broken/dangling ancestry → `ErrBrokenChain`. Reviews: ✅ Go · ✅
-  security (both PASS-with-nits → folded).
-- ✅ **6.2 firewall per-scope enforcement** (`internal/firewall.EnterChain`) —
-  generalized from one global Limits over {key,run} to per-scope caps over the
-  chain; `Enter` is now the 2-scope wrapper. `KillRun`/`RunKilled` single-source
-  the run key so a chain-entered run is killable; fail-closed on malformed chains;
-  negative-estimate clamp. Reviews: ✅ Go (PASS-nits) · ✅ security
-  (CHANGES-NEEDED→fixed: kill-key incompatibility, empty/dup run scope fail-open).
-- ✅ **6.3 enforcer adapter** (`internal/enforcer`) — binds policy↔firewall
-  (Translate + fail-closed Resolver: only unknown-key falls through, failures
-  deny). Review: ✅ combined (PASS-nits → folded: dangling-key fail-closed in
-  policy; calendar-budget runtime-gap doc).
-- ⬜ **6.4 live wiring (3b)** — server resolves the chain per request, denies on
-  `chain.KilledBy` (consume N1 + test it), calls `EnterChain`; kill endpoint uses
-  the run scope key; config `policy:` section (declarative hierarchy, Inv #6) +
-  cmd builds the store and injects the resolver (optional → nil = today's flat
-  behavior). Then the phase gate's dual review closes on the end-to-end path.
-- ⬜ **6.5 later** — calendar (Day/Month) enforcement tied to the durable ledger;
-  admin HTTP API (create team/app, set budget, issue key, node kill);
-  Postgres-backed policy store; deny responses naming the binding node.
-- ⬜ **Open decision** (blocks push): publish the control-plane code + ADRs
-  0004/0005/0006 in the public repo, or split into an enterprise repo (open-core).
-- ⬜ **Stale docs** to rewrite around the PDP/control-plane model: README "Where it
-  sits", `docs/DEPLOYMENT.md` (both still carry the rejected inline-proxy framing).
+  `Resolve(keySHA,runID)→Chain`. Fail-closed. Reviews: Go + security (folded).
+- ✅ **6.2 firewall per-scope enforcement** (`internal/firewall.EnterChain`) — the
+  ENGINE, generalized from {key,run}+global-Limits to per-scope caps over a chain.
+  `KillRun`/`RunKilled`. Reviews: Go + security (kill-key + fail-open fixed).
+- ✅ **6.3 enforcer adapter** (`internal/enforcer`) — binds policy↔firewall,
+  fail-closed Resolver. Review: combined (folded).
+- ✅ **6.4 management API** (`internal/server/policy_admin.go`) — admin-gated CRUD
+  over the hierarchy + `Snapshot`; `control_plane.enabled` config + cmd wiring.
+  Tests cover flow/gating/errors. (Store is in-memory; not durable across restarts.)
+- ⬜ **6.5 LIVE ENFORCEMENT WIRING** — ⚠ THE ENGINE IS NOT YET IN THE REQUEST PATH.
+  `handleChatCompletions` still calls flat `Enter`, NOT the resolver+`EnterChain`.
+  Do: server resolves the chain per request via `enforcer.Resolve`, denies on
+  `chain.KilledBy` (+ test), calls `EnterChain`; kill endpoint uses the run scope
+  key. Until this lands, provisioned budgets are NOT enforced on live traffic.
+- ⬜ **6.6** durable Postgres policy store; calendar (Day/Month) enforcement (needs
+  the ledger); deny responses naming the binding node.
+- ⬜ **6.7 stale docs** — README "Where it sits" + `docs/DEPLOYMENT.md` still carry
+  the rejected inline-proxy framing; rewrite around the PDP/control-plane model.
+
+## Phase 7 — OOB integration surface (the PDP wedge) — 📐 DESIGN-ONLY, NO CODE YET
+This is what the LiteLLM/Envoy/library integration story is PINNED ON. Today the
+engine is reachable ONLY inline (send the chat completion THROUGH heave). There is
+NO standalone decision API and NO adapter.
+- ⬜ **7.1 ADR 0007** — the `/v1/guard/*` decision API: reserve/settle/release as a
+  PURE decision (scope + a number, never the payload); reservation = a LEASE with a
+  TTL so a missing settle/release self-heals.
+- ⬜ **7.2 `/v1/guard/reserve|settle|release` endpoints** wrapping
+  `EnterChain`/`Ticket.Settle`/`Ticket.Release`. Reserve returns `{admitted,
+  reservation_id, http_status, deny_reason(binding node)}`. Reviews: Go + security.
+- ⬜ **7.3 LiteLLM adapter** — a `CustomGuardrail` (Python) mapping
+  pre_call→reserve, post_success→settle, post_failure→release; threads the
+  reservation id via `data["metadata"]`; maps LiteLLM team/key→heave scope. Ships
+  as an example + package. (Skeleton exists only in chat, NOT in the repo.)
+- ⬜ **7.4** other PEPs: Envoy `ext_authz`, a Go client lib.
+
+## Phase 8 — Admin console + SSO (enterprise-ready) — 🟡 WIP (core uncommitted)
+- ✅ **8.0 design** — console mockup (SSO sign-in + org spend/budget views); shared
+  as a Claude artifact. Direction approved.
+- 🟡 **8.1 auth core** (`internal/console`) — `passwords.go` (PBKDF2, stdlib) +
+  `console.go` (signed session cookies, local login, admin allowlist, OAuth state).
+  Status: files written, NO tests yet, NOT gated, NOT wired, NOT reviewed. Finish =
+  tests + gate + Go/security review + commit before building on it.
+- ⬜ **8.2 SSO** — Google (OIDC) + GitHub authorization-code flows over the 8.1
+  session layer; secrets from env (Inv #4); allowlist authz.
+- ⬜ **8.3 console UI** — serve the designed console; wire to the management API via
+  the session (CSRF-guarded).
+
+## OPEN DECISION FOR THE USER — priority order across Phases 6.5 / 7 / 8
+The wedge is "hard real-time enforcement, integrated OOB." That argues 6.5 (make
+the engine actually enforce live) → 7 (expose it as a decision API + LiteLLM proof)
+BEFORE finishing 8 (console/SSO polish). Confirm the order before building further.
 
 ## Carried-over deferred items (from Phase 0/1 reviews — still live)
 - ⬜ Per-client/route rejection + velocity counters on /metrics.

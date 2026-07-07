@@ -75,6 +75,11 @@ linters:
           deny:
             - pkg: github.com/somasays/heave/internal
               desc: "internal/policy is the org model + resolution; it must stay pure (no other internal packages)"
+        console-pure:
+          files: ["**/internal/console/**"]
+          deny:
+            - pkg: github.com/somasays/heave/internal
+              desc: "internal/console is the pure auth layer (stdlib crypto only); it must not import other internal packages"
         enforcer-boundary:
           files: ["**/internal/enforcer/**"]
           # The adapter that binds the policy model to the firewall engine. It may

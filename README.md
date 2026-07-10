@@ -77,6 +77,52 @@ fleet** (one atomic Redis reserve/settle), not N× per instance. Every request i
 **attributed** by client and run — in memory, on a built-in `/dashboard`, and in a
 durable Postgres ledger (`/v1/spend`).
 
+## Where it sits — two modes
+
+The enforcement engine is the product; there are two ways to invoke it.
+
+**1. Inline (zero-integration).** Your agents call heave instead of the vendor; it
+enforces, then forwards. Adoption is a base-URL swap — heave speaks the OpenAI API.
+Lock egress so only heave reaches the vendors and agents **can't bypass** it.
+
+```
+ agents ──(OpenAI API + Bearer + X-Heave-Run-Id)──▶ heave ──▶ Anthropic / OpenAI-compatible vendors
+```
+```python
+from openai import OpenAI
+client = OpenAI(base_url="https://heave.internal/v1", api_key="<team-key>")
+client.chat.completions.create(model="fast", messages=[...],
+    extra_headers={"X-Heave-Run-Id": run_id})   # scopes the per-run controls
+```
+
+**2. Decision point (OOB) — for orgs that already run a gateway.** If you run
+LiteLLM/Portkey/Envoy and won't accept a second data-path hop, heave is a **Policy
+Decision Point**: your gateway asks heave `reserve → settle/release` (a scope + a
+number, *never* the payload), and the LLM traffic keeps flowing your gateway →
+vendor directly. heave is **consulted, not interposed.**
+
+```
+ agents ──▶ LiteLLM ─────────────────────────────▶ vendors      (data path — heave NOT in it)
+               └── reserve/settle/release ──▶ heave /v1/guard    (a fast decision call)
+```
+
+The integration is a ~50-line adapter binding your gateway's policy hook to
+`reserve/settle/release` — [**`integrations/litellm/`**](integrations/litellm/)
+ships the reference LiteLLM `CustomGuardrail` ([ADR 0004](docs/adr/0004-enforcement-integration-contract.md),
+[0007](docs/adr/0007-guard-decision-api.md)). Same engine, same budgets, both modes.
+
+**Org control plane.** Either mode, provision budgets at **any** level of
+`org ▸ team ▸ app ▸ run` (a team pool *and* per-app caps), trip per-node kill
+switches, and issue keys — via the admin-gated `/v1/policy` API or the built-in
+**console** (local + Google/GitHub SSO). Budgets compose under one rule: a request
+is admitted iff it fits under every ancestor ([ADR 0006](docs/adr/0006-hierarchical-budgets-resolution.md)).
+
+Deploy as a **central, horizontally-scaled service** (recommended — a stateless Go
+binary; add Redis for shared caps + the decision API, Postgres for the durable
+ledger), a **sidecar**, or the OOB decision point above. Full topologies, a
+Kubernetes example, HA/fail-open behavior, and the security posture are in
+[**`docs/DEPLOYMENT.md`**](docs/DEPLOYMENT.md).
+
 ## What it is — and isn't
 
 - **It is:** hard, real-time, pre-vendor enforcement on a fast Go data-plane —

@@ -29,6 +29,7 @@ func (s *Server) handleConsolePage(w http.ResponseWriter, _ *http.Request) {
 // default-src 'self' CSP on the page).
 func (s *Server) handleConsoleAppJS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache") // revalidate so console updates take effect
 	_, _ = w.Write(consoleJS)
 }
 

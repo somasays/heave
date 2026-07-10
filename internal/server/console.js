@@ -15,6 +15,8 @@ async function api(method, path, body){
 }
 function show(view){$("#login").classList.toggle("hidden",view!=="login");$("#app").classList.toggle("hidden",view!=="app");}
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+// slug turns free text into a valid node id: [A-Za-z0-9._-], no spaces.
+function slug(s){return String(s||"").trim().toLowerCase().replace(/[^a-z0-9._-]+/g,"-").replace(/^-+|-+$/g,"").slice(0,128);}
 function fmtLimits(l){const p=[];if(l.max_usd_per_day)p.push("$"+l.max_usd_per_day+"/d");if(l.max_usd_per_min)p.push("$"+l.max_usd_per_min+"/m");if(l.max_concurrent)p.push(l.max_concurrent+" conc");if(l.max_usd_per_run)p.push("$"+l.max_usd_per_run+"/run");return p.join(" · ")||"—";}
 
 // ---- boot ----
@@ -115,7 +117,7 @@ function createForm(type){
     :type==="app"?`<div class="field"><label>Team id</label><input id="c_parent" value="${STATE.sel.parent||''}"></div>`:"";
   return `<h2>New ${type}</h2><div class="path">create a ${type}</div>
     <div class="form">
-      <div class="row"><div class="field"><label>id</label><input id="c_id"></div><div class="field"><label>name</label><input id="c_name"></div></div>
+      <div class="row"><div class="field"><label>name</label><input id="c_name" placeholder="Platform Team" autocomplete="off"></div><div class="field"><label>id <span style="color:var(--faint)">(slug — auto from name)</span></label><input id="c_id" placeholder="platform" autocomplete="off"></div></div>
       ${parentField?'<div class="row">'+parentField+'<div></div></div>':""}
       ${limitInputs({})}
       <div class="actions"><button class="btn primary sm" id="createBtn">Create</button><button class="btn sm" id="cancelBtn">Cancel</button></div>
@@ -124,7 +126,10 @@ function createForm(type){
 function wireCreate(){
   $("#cancelBtn").addEventListener("click",()=>{STATE.sel=STATE.nodes[0]||null;render();});
   $("#createBtn").addEventListener("click",async()=>{
-    const type=STATE.sel._new, body={id:$("#c_id").value,name:$("#c_name").value,limits:readLimits()};
+    const type=STATE.sel._new;
+    const id=slug($("#c_id").value||$("#c_name").value);   // id from the id field, else slugified name
+    if(!id){toast("enter a name or id",true);return;}
+    const body={id, name:$("#c_name").value||id, limits:readLimits()};
     let path;
     if(type==="org")path="/v1/policy/orgs";
     else if(type==="team"){path="/v1/policy/teams";body.org_id=$("#c_parent").value;}

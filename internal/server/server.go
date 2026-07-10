@@ -196,6 +196,7 @@ func (s *Server) Handler() http.Handler {
 	// Admin-console login (local + SSO), mounted only when the console is configured.
 	if s.console != nil {
 		mux.HandleFunc("GET /console", s.handleConsolePage)
+		mux.HandleFunc("GET /console/app.js", s.handleConsoleAppJS)
 		mux.HandleFunc("GET /console/info", s.handleConsoleInfo)
 		mux.HandleFunc("POST /console/login", s.handleConsoleLoginLocal)
 		mux.HandleFunc("POST /console/logout", s.handleConsoleLogout)

@@ -228,6 +228,17 @@ func TestConsolePageAndInfo(t *testing.T) {
 	if ct := pr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("/console must be html, got %q", ct)
 	}
+	// The script must be an EXTERNAL same-origin file (the page CSP is default-src
+	// 'self', which forbids inline <script> — regression: an inline script rendered
+	// a blank page). And that file must actually serve.
+	if !strings.Contains(pr.Body.String(), `src="/console/app.js"`) {
+		t.Fatal("console must load its script from /console/app.js (not inline; CSP blocks inline)")
+	}
+	jr := httptest.NewRecorder()
+	h.ServeHTTP(jr, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/console/app.js", nil))
+	if jr.Code != 200 || !strings.HasPrefix(jr.Header().Get("Content-Type"), "text/javascript") {
+		t.Fatalf("/console/app.js must serve JS, got %d %q", jr.Code, jr.Header().Get("Content-Type"))
+	}
 	// /console/info reflects no session + the configured providers.
 	ir := httptest.NewRecorder()
 	h.ServeHTTP(ir, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/console/info", nil))

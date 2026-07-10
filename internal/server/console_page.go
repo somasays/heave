@@ -12,12 +12,24 @@ import (
 //go:embed console.html
 var consoleHTML []byte
 
+//go:embed console.js
+var consoleJS []byte
+
 // handleConsolePage serves the console shell. It is intentionally open (like a
-// login page); all data it fetches is behind the session-gated management API.
+// login page); all data it fetches is behind the session-gated management API. The
+// script is a SEPARATE same-origin file (served below) so the CSP can stay strict
+// (no 'unsafe-inline' scripts) while default-src 'self' permits it.
 func (s *Server) handleConsolePage(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
 	_, _ = w.Write(consoleHTML)
+}
+
+// handleConsoleAppJS serves the console SPA script (same-origin; allowed by the
+// default-src 'self' CSP on the page).
+func (s *Server) handleConsoleAppJS(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	_, _ = w.Write(consoleJS)
 }
 
 // handleConsoleInfo reports the current session state + which SSO providers are

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -212,6 +213,44 @@ func TestOAuthCallbackRejectsBadStateAndNonAdmin(t *testing.T) {
 	h2 := newConsoleEnv(t, fakeIdP{email: "outsider@evil.com", name: "X"})
 	if rr := oauthRoundTrip(t, h2, "google", "code"); rr.Code != http.StatusForbidden {
 		t.Fatalf("a non-allowlisted identity must be 403, got %d", rr.Code)
+	}
+}
+
+func TestConsolePageAndInfo(t *testing.T) {
+	h := newConsoleEnv(t, fakeIdP{email: "ceo@acme.com"})
+	// The SPA shell is served (open, like a login page).
+	pg := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/console", nil)
+	pr := httptest.NewRecorder()
+	h.ServeHTTP(pr, pg)
+	if pr.Code != 200 || !strings.Contains(pr.Body.String(), "control plane") {
+		t.Fatalf("/console must serve the SPA, got %d", pr.Code)
+	}
+	if ct := pr.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("/console must be html, got %q", ct)
+	}
+	// /console/info reflects no session + the configured providers.
+	ir := httptest.NewRecorder()
+	h.ServeHTTP(ir, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/console/info", nil))
+	var info struct {
+		Providers     []string `json:"providers"`
+		Authenticated bool     `json:"authenticated"`
+	}
+	_ = json.Unmarshal(ir.Body.Bytes(), &info)
+	if info.Authenticated {
+		t.Fatal("no cookie ⇒ not authenticated")
+	}
+	if len(info.Providers) != 1 || info.Providers[0] != "google" {
+		t.Fatalf("info must list configured providers, got %+v", info.Providers)
+	}
+	// After login, info reports authenticated.
+	lr := postJSON(t, h, "/console/login", `{"username":"ops","password":"s3cret"}`)
+	sc := sessionCookie(lr)
+	ir2 := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/console/info", nil)
+	req.AddCookie(sc)
+	h.ServeHTTP(ir2, req)
+	if !strings.Contains(ir2.Body.String(), `"authenticated":true`) {
+		t.Fatalf("info with an admin session must be authenticated, got %s", ir2.Body)
 	}
 }
 

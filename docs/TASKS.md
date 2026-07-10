@@ -267,14 +267,15 @@ so a PEP enforces heave OOB with no data-path hop.
 ## Phase 8 — Admin console + SSO (enterprise-ready) — 🟡 WIP (core uncommitted)
 - ✅ **8.0 design** — console mockup (SSO sign-in + org spend/budget views); shared
   as a Claude artifact. Direction approved.
-- 🟡 **8.1 auth core** (`internal/console`) — `passwords.go` (PBKDF2, stdlib) +
-  `console.go` (signed session cookies, local login, admin allowlist, OAuth state).
-  Status: files written, NO tests yet, NOT gated, NOT wired, NOT reviewed. Finish =
-  tests + gate + Go/security review + commit before building on it.
-- ⬜ **8.2 SSO** — Google (OIDC) + GitHub authorization-code flows over the 8.1
-  session layer; secrets from env (Inv #4); allowlist authz.
-- ⬜ **8.3 console UI** — serve the designed console; wire to the management API via
-  the session (CSRF-guarded).
+- ✅ **8.1 auth core** (`internal/console`) — PBKDF2 local login, signed session
+  cookies, admin allowlist, OAuth state. Tested, gated, dual-reviewed
+  (docs/reviews/phase8-console-auth.md); Secure-by-default + work-factor floor.
+- ✅ **8.2 SSO** — Google/GitHub OAuth login + logout + session-gated requireAdmin
+  (`console_http.go`); config + cmd wiring. Tested (fake-IdP round-trip). ⚠ the two
+  review agents STALLED on infra (no verdict) — manual pass done + open-redirect
+  hardened; a fresh /security-review is recommended to close the dual-review gate.
+- ⬜ **8.3 console UI** — serve the designed console (login + org spend/budget/tree/
+  kill views); wire to /v1/policy via the session (CSRF-guarded).
 
 ## OPEN DECISION FOR THE USER — priority order across Phases 6.5 / 7 / 8
 The wedge is "hard real-time enforcement, integrated OOB." That argues 6.5 (make

@@ -245,8 +245,9 @@ request fits under every ancestor. Open-core decision: RESOLVED — publish publ
   concurrency + monthly budget still bind). Documented in ADR 0006 §9. Options: a
   per-node `require_run_id`, or synthesize a per-request run scope so the app-level
   `MaxUSDPerRun` still applies. Decide + implement.
-- ⬜ **6.7 stale docs** — README "Where it sits" + `docs/DEPLOYMENT.md` still carry
-  the rejected inline-proxy framing; rewrite around the PDP/control-plane model.
+- ✅ **6.7 stale docs** — README "Where it sits" → "two modes" (inline + OOB PDP);
+  DEPLOYMENT §1/§3C reframed around the decision API (no data-path hop) + new §8
+  org control plane / console. Front-page framing now matches what's shipped.
 
 ## Phase 7 — OOB integration surface (the PDP wedge) — BUILT + PUSHED
 The engine is now reachable as a PURE decision (scope + estimate, never payload),
@@ -274,8 +275,9 @@ so a PEP enforces heave OOB with no data-path hop.
   (`console_http.go`); config + cmd wiring. Tested (fake-IdP round-trip). ⚠ the two
   review agents STALLED on infra (no verdict) — manual pass done + open-redirect
   hardened; a fresh /security-review is recommended to close the dual-review gate.
-- ⬜ **8.3 console UI** — serve the designed console (login + org spend/budget/tree/
-  kill views); wire to /v1/policy via the session (CSRF-guarded).
+- ✅ **8.3 console UI** — self-contained SPA at `GET /console` (login + org tree +
+  per-node budgets + create/edit/kill/issue-key), wired to `/v1/policy` via the
+  session; CSP-locked, output-escaped, SameSite CSRF. Endpoint-tested + JS-checked.
 
 ## OPEN DECISION FOR THE USER — priority order across Phases 6.5 / 7 / 8
 The wedge is "hard real-time enforcement, integrated OOB." That argues 6.5 (make

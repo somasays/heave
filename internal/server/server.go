@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/somasays/heave/internal/broker"
+	"github.com/somasays/heave/internal/console"
 	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/firewall"
 	"github.com/somasays/heave/internal/health"
@@ -41,10 +42,14 @@ type Server struct {
 	redactor       *redact.Redactor
 	firewall       *firewall.Firewall
 	broker         *broker.Broker
-	policy         *policy.Store // nil ⇒ control plane off (routes not mounted)
-	resolver       ChainResolver // nil ⇒ flat enforcement (no chain resolution)
-	guardSecret    []byte        // HMAC key for reservation tokens; nil ⇒ /v1/guard off
-	guardDedup     GuardDedup    // shared settle/release idempotency (required for guard)
+	policy         *policy.Store            // nil ⇒ control plane off (routes not mounted)
+	resolver       ChainResolver            // nil ⇒ flat enforcement (no chain resolution)
+	guardSecret    []byte                   // HMAC key for reservation tokens; nil ⇒ /v1/guard off
+	guardDedup     GuardDedup               // shared settle/release idempotency (required for guard)
+	console        *console.Manager         // nil ⇒ console login endpoints not mounted
+	oauth          map[string]OAuthProvider // SSO providers by name (google|github)
+	consoleBaseURL string                   // external base URL for OAuth redirect URIs
+	consoleSecure  bool                     // Secure flag on the OAuth nonce cookie
 	ledgerReader   LedgerReader
 	log            *slog.Logger
 	maxRequestBody int64
@@ -70,20 +75,24 @@ type ChainResolver interface {
 
 // Deps bundles the collaborators the server orchestrates.
 type Deps struct {
-	Router       *router.Router
-	Providers    map[string]provider.Provider
-	Ledger       *ledger.Ledger
-	Guard        *controls.Guard
-	Health       *health.Tracker
-	Redactor     *redact.Redactor
-	Firewall     *firewall.Firewall
-	Broker       *broker.Broker
-	Policy       *policy.Store // optional org control plane; nil ⇒ management API off
-	Resolver     ChainResolver // optional chain resolver; nil ⇒ flat enforcement
-	GuardSecret  []byte        // HMAC key for the /v1/guard decision API; nil/short ⇒ off
-	GuardDedup   GuardDedup    // shared reconcile dedup (required to enable the guard API)
-	LedgerReader LedgerReader
-	Log          *slog.Logger
+	Router         *router.Router
+	Providers      map[string]provider.Provider
+	Ledger         *ledger.Ledger
+	Guard          *controls.Guard
+	Health         *health.Tracker
+	Redactor       *redact.Redactor
+	Firewall       *firewall.Firewall
+	Broker         *broker.Broker
+	Policy         *policy.Store            // optional org control plane; nil ⇒ management API off
+	Resolver       ChainResolver            // optional chain resolver; nil ⇒ flat enforcement
+	GuardSecret    []byte                   // HMAC key for the /v1/guard decision API; nil/short ⇒ off
+	GuardDedup     GuardDedup               // shared reconcile dedup (required to enable the guard API)
+	Console        *console.Manager         // optional admin-console auth; nil ⇒ login endpoints off
+	OAuth          map[string]OAuthProvider // SSO providers (google|github); may be empty
+	ConsoleBaseURL string                   // external base URL for OAuth redirect URIs
+	ConsoleSecure  bool                     // Secure flag on the OAuth nonce cookie
+	LedgerReader   LedgerReader
+	Log            *slog.Logger
 }
 
 // Options configures request hardening limits.
@@ -144,6 +153,10 @@ func New(d Deps, opts Options) *Server {
 		resolver:       d.Resolver,
 		guardSecret:    d.GuardSecret,
 		guardDedup:     d.GuardDedup,
+		console:        d.Console,
+		oauth:          d.OAuth,
+		consoleBaseURL: d.ConsoleBaseURL,
+		consoleSecure:  d.ConsoleSecure,
 		ledgerReader:   d.LedgerReader,
 		log:            d.Log,
 		maxRequestBody: opts.MaxRequestBytes,
@@ -179,6 +192,13 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /v1/guard/reserve", s.handleGuardReserve)
 		mux.HandleFunc("POST /v1/guard/settle", s.handleGuardSettle)
 		mux.HandleFunc("POST /v1/guard/release", s.handleGuardRelease)
+	}
+	// Admin-console login (local + SSO), mounted only when the console is configured.
+	if s.console != nil {
+		mux.HandleFunc("POST /console/login", s.handleConsoleLoginLocal)
+		mux.HandleFunc("POST /console/logout", s.handleConsoleLogout)
+		mux.HandleFunc("GET /console/auth/{provider}/start", s.handleOAuthStart)
+		mux.HandleFunc("GET /console/auth/{provider}/callback", s.handleOAuthCallback)
 	}
 	return mux
 }
@@ -269,6 +289,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 // auth is disabled (dev), access is open — the startup path already warns loudly
 // that auth is off. Returns true when the request may proceed.
 func (s *Server) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	// A valid admin CONSOLE SESSION (browser cookie) grants access — this is how the
+	// console UI calls the management API. API/PEP callers use an admin bearer key.
+	if s.adminSession(r) {
+		return true
+	}
 	// Authenticate (not Admit) so a 3s dashboard poll doesn't consume the admin
 	// key's chat rate-limit bucket.
 	client, err := s.guard.Authenticate(bearerToken(r))

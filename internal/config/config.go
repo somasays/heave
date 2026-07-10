@@ -41,6 +41,48 @@ type ControlPlane struct {
 	// the ENVIRONMENT, never the file (Invariant #4). Empty ⇒ the OOB decision API
 	// is OFF (only the inline path + management API are available).
 	GuardSecretEnv string `yaml:"guard_secret_env"`
+	// Console configures the admin console's login (SSO + local accounts).
+	Console Console `yaml:"console"`
+}
+
+// Console configures the admin console authentication. Empty/disabled ⇒ the console
+// login endpoints are not mounted (the management + guard APIs still work with an
+// admin bearer key). Secrets (session HMAC key, OAuth client secrets) come from the
+// ENVIRONMENT (Invariant #4); the file holds only non-secret ids/hashes.
+type Console struct {
+	Enabled bool `yaml:"enabled"`
+	// SessionSecretEnv names the env var holding the session-cookie HMAC key (>=32B).
+	SessionSecretEnv string        `yaml:"session_secret_env"`
+	SessionTTL       time.Duration `yaml:"session_ttl"`
+	// BaseURL is the console's externally-reachable base (e.g. https://gw.acme.com),
+	// used to build OAuth redirect URIs. Required for SSO.
+	BaseURL string `yaml:"base_url"`
+	// AllowInsecure emits session cookies without the Secure flag — LOCAL HTTP DEV
+	// ONLY. Leave false in production.
+	AllowInsecure bool `yaml:"allow_insecure"`
+	// AdminEmails / AdminDomains authorize SSO identities as admin.
+	AdminEmails  []string `yaml:"admin_emails"`
+	AdminDomains []string `yaml:"admin_domains"`
+	// Accounts are local (username/password) operators. PasswordHash is a PBKDF2
+	// string (not the plaintext); generate it out-of-band.
+	Accounts []ConsoleAccount `yaml:"accounts"`
+	// Google / GitHub OAuth apps. ClientID is public; the secret is from env.
+	Google OAuthApp `yaml:"google"`
+	GitHub OAuthApp `yaml:"github"`
+}
+
+// ConsoleAccount is one local operator login.
+type ConsoleAccount struct {
+	Username     string `yaml:"username"`
+	PasswordHash string `yaml:"password_hash"`
+	Admin        bool   `yaml:"admin"`
+}
+
+// OAuthApp is one SSO provider's app credentials. Empty ClientID ⇒ that provider
+// is not offered.
+type OAuthApp struct {
+	ClientID        string `yaml:"client_id"`
+	ClientSecretEnv string `yaml:"client_secret_env"`
 }
 
 // Firewall configures the runtime spend & quota firewall (Invariant #9): hard,

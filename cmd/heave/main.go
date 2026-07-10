@@ -20,6 +20,7 @@ import (
 
 	"github.com/somasays/heave/internal/broker"
 	"github.com/somasays/heave/internal/config"
+	"github.com/somasays/heave/internal/console"
 	"github.com/somasays/heave/internal/controls"
 	"github.com/somasays/heave/internal/enforcer"
 	"github.com/somasays/heave/internal/firewall"
@@ -209,11 +210,15 @@ func run(configPath string, log *slog.Logger) error {
 		}
 	}
 
+	consoleMgr, oauthProviders, consoleBase, consoleSecure := buildConsole(cfg.ControlPlane.Console, log)
+
 	srv := server.New(server.Deps{
 		Router: rtr, Providers: providers, Ledger: led, Guard: guard,
 		Health: tracker, Redactor: redactor, Firewall: fw, Broker: qb,
 		Policy: polStore, Resolver: chainResolver,
 		GuardSecret: guardSecret, GuardDedup: guardDedup,
+		Console: consoleMgr, OAuth: oauthProviders,
+		ConsoleBaseURL: consoleBase, ConsoleSecure: consoleSecure,
 		LedgerReader: ledgerReader, Log: log,
 	}, server.Options{
 		MaxRequestBytes: cfg.Server.MaxRequestBytes,
@@ -267,6 +272,44 @@ func run(configPath string, log *slog.Logger) error {
 // buildProviders constructs one adapter per configured provider. API keys are
 // read from the environment here and passed to adapters; they never live in
 // config or code.
+// buildConsole constructs the admin-console auth from config, or returns nils when
+// it is disabled / misconfigured (login endpoints then stay unmounted). Secrets
+// (session HMAC key, OAuth client secrets) are read from the environment.
+func buildConsole(cc config.Console, log *slog.Logger) (*console.Manager, map[string]server.OAuthProvider, string, bool) {
+	if !cc.Enabled {
+		return nil, nil, "", false
+	}
+	secret := os.Getenv(cc.SessionSecretEnv)
+	if len(secret) < 32 {
+		log.Warn("admin console is enabled but session_secret_env is missing/too short (<32 bytes); console login is OFF", "env", cc.SessionSecretEnv)
+		return nil, nil, "", false
+	}
+	accounts := make([]console.Account, 0, len(cc.Accounts))
+	for _, a := range cc.Accounts {
+		accounts = append(accounts, console.Account{Username: a.Username, PWHash: a.PasswordHash, Admin: a.Admin})
+	}
+	mgr, err := console.New(console.Options{
+		Secret: []byte(secret), TTL: cc.SessionTTL, Accounts: accounts,
+		AdminEmails: cc.AdminEmails, AdminDomains: cc.AdminDomains, AllowInsecure: cc.AllowInsecure,
+	})
+	if err != nil {
+		log.Warn("admin console disabled", "err", err)
+		return nil, nil, "", false
+	}
+	providers := map[string]server.OAuthProvider{}
+	if cc.Google.ClientID != "" {
+		providers["google"] = server.NewGoogleIdP(cc.Google.ClientID, os.Getenv(cc.Google.ClientSecretEnv))
+	}
+	if cc.GitHub.ClientID != "" {
+		providers["github"] = server.NewGitHubIdP(cc.GitHub.ClientID, os.Getenv(cc.GitHub.ClientSecretEnv))
+	}
+	if cc.BaseURL == "" && len(providers) > 0 {
+		log.Warn("admin console SSO is configured but control_plane.console.base_url is empty; OAuth redirect URIs will be malformed")
+	}
+	log.Info("admin console login enabled", "sso_providers", len(providers), "local_accounts", len(accounts), "secure", !cc.AllowInsecure)
+	return mgr, providers, cc.BaseURL, !cc.AllowInsecure
+}
+
 func buildProviders(cfg *config.Config, log *slog.Logger) map[string]provider.Provider {
 	providers := make(map[string]provider.Provider, len(cfg.Providers))
 	for _, p := range cfg.Providers {
